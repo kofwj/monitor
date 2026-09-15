@@ -127,7 +127,16 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
 echo "downloading monitor-agent ($ARCH)"
-curl -fsSL "$URL" -o "$TMP"
+# The hub relays only a release matching the digest pinned in its own source, so
+# a mirror that has been replaced and a hub whose pin is older than the release
+# it is asked for both refuse here. Without this the operator sees curl's exit
+# status and nothing about which of the two happened.
+curl -fsSL "$URL" -o "$TMP" || {
+	echo "the hub refused to serve the agent binary at $URL" >&2
+	echo "it relays only the release matching the digest pinned in its source;" >&2
+	echo "check the hub's log, and its GitHub proxy setting if one is set." >&2
+	exit 1
+}
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it

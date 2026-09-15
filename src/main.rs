@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chrono::{Local, Months, NaiveDate};
+use sha2::{Digest, Sha256};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -112,6 +113,68 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// implies a fork, which rebuilds this line anyway.
 const AGENT_REPO: &str = "monitor-probe/agent";
 
+/// The agent release this hub relays, and the digest each architecture's binary
+/// must have.
+///
+/// Compiled in beside `install.sh`, for the same reason that file is: what ships
+/// is what was reviewed, and a file the hub reads from disk at runtime is a file
+/// something else on the host can rewrite. The format is `<tag> <arch> <sha256>`,
+/// one line per architecture, because the two are separate assets of one release.
+///
+/// The tag is what the release URL is built from, so it is this file -- not
+/// GitHub's moving `latest` -- that decides which release a node installs. The
+/// cost is that a new agent release is not served until a hub release moves the
+/// pin; the alternative is relaying whatever a mirror answers with, unverified,
+/// to every node that installs.
+const AGENT_PIN: &str = include_str!("../agent.pin");
+
+/// One line of [`AGENT_PIN`]: the release an architecture is served from, and
+/// the digest its binary must have.
+struct Pinned {
+    arch: &'static str,
+    tag: &'static str,
+    digest: [u8; 32],
+}
+
+/// The pin, parsed once.
+///
+/// Cached rather than re-parsed per request so that a malformed line is reported
+/// when the file is first used instead of on every install. The file is compiled
+/// in, so it cannot change while the hub runs and there is nothing to invalidate.
+fn pins() -> &'static [Pinned] {
+    static PINS: std::sync::OnceLock<Vec<Pinned>> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        AGENT_PIN
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                // Rejects too few fields and too many alike: a line with a stray
+                // column is a line somebody edited, and reading it as if the
+                // extra one were absent would pin something unintended.
+                let [tag, arch, digest] = line.split_whitespace().collect::<Vec<_>>()[..] else {
+                    warn!("agent.pin: '{line}' is not '<tag> <arch> <sha256>'");
+                    return None;
+                };
+                let Some(digest) =
+                    hex::decode(digest).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                else {
+                    warn!("agent.pin: '{digest}' for {arch} is not a sha256");
+                    return None;
+                };
+                Some(Pinned { arch, tag, digest })
+            })
+            .collect()
+    })
+}
+
+/// The release pinned for `arch`.
+fn pinned(arch: &str) -> Option<&'static Pinned> {
+    pins().iter().find(|pin| pin.arch == arch)
+}
+
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
     ([(header::CONTENT_TYPE, "text/x-shellscript")], include_str!("../install.sh")).into_response()
@@ -124,12 +187,19 @@ async fn install_script() -> Response {
 ///
 /// This URL is fetched on an anonymous request, so setting it redirects that
 /// path. It remains within the bounds `agent_binary` already enforces: four
-/// concurrent transfers, a 120-second timeout, and a streamed body.
-fn release_url(app: &App, arch: &str) -> String {
+/// concurrent transfers, a 120-second timeout, and a body no larger than
+/// [`RELAY_MAX`].
+///
+/// `tag` comes from [`pinned`] rather than being GitHub's `latest`. Pinning the
+/// digest alone would leave `latest` deciding what the digest is checked
+/// against, so a new upstream release would turn every install into a refusal
+/// until an operator noticed -- and the point of pinning is to move deliberately
+/// rather than to fail on someone else's schedule.
+fn release_url(app: &App, tag: &str, arch: &str) -> String {
     proxied(
         app,
         format!(
-            "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
+            "https://github.com/{AGENT_REPO}/releases/download/{tag}/monitor-agent-{arch}-unknown-linux-musl"
         ),
     )
 }
@@ -163,20 +233,28 @@ static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RE
 /// 1.8 MB; what it rules out is a transfer that never completes.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Most this route will buffer from one release.
+///
+/// The two binaries are 1.5 and 1.8 MB, so this leaves room for a release that
+/// grows while ruling out a mirror that answers with something else entirely --
+/// or with no end at all. It bounds memory as much as size: the body is held
+/// whole until the client has read it, and `RELAY_SLOTS` permits are all that may
+/// be in flight, so the route as a whole holds four of these at once.
+const RELAY_MAX: usize = 8 * 1024 * 1024;
+
 /// Holds a relay permit until the last byte has been sent. The handler returns
-/// once the response head is built, so a permit dropped there would gate only
-/// the fetch and leave the transfer -- the expensive part -- unbounded.
+/// once the response head is built, so a permit dropped there would gate only the
+/// fetch and leave the body -- the 1.8 MB the hub now holds on the client's
+/// behalf -- alive and unbounded.
 ///
 /// The permit is not held here, because "until the last byte" has no upper bound
 /// of its own: a client that stops reading leaves hyper unable to flush, hyper
 /// then stops polling this stream, and a deadline checked in `poll_next` would
-/// never run -- nor would the upstream timeout on the reqwest body, which is
-/// equally poll-driven. Four connections that accept the response and never read
-/// it would hold all four slots for as long as they remained open, and
-/// `/agent/{arch}` is the path every node installs through. The permit therefore
-/// belongs to a task with its own timer, and this end of the channel -- dropped
-/// with the body, whether it completed or the connection died -- releases it
-/// early.
+/// never run. Four connections that accept the response and never read it would
+/// hold all four slots for as long as they remained open, and `/agent/{arch}` is
+/// the path every node installs through. The permit therefore belongs to a task
+/// with its own timer, and this end of the channel -- dropped with the body,
+/// whether it completed or the connection died -- releases it early.
 struct Metered<S> {
     inner: S,
     _done: tokio::sync::oneshot::Sender<()>,
@@ -206,44 +284,104 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
     }
 }
 
+/// The verified release, handed to the response body in one chunk.
+///
+/// A buffer rather than a stream of the upstream response, because the digest
+/// cannot be checked against a file that has not arrived -- and bytes already
+/// relayed cannot be taken back. It still travels through [`metered`]: a buffer
+/// is memory the hub holds until the client has read it, which is what
+/// [`RELAY_MAX`] and the permit are sized against together.
+struct Once(Option<Vec<u8>>);
+
+impl futures_core::Stream for Once {
+    type Item = Result<Vec<u8>, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.0.take().map(Ok))
+    }
+}
+
 /// Serves the agent binary from the hub itself, so a node that can reach the hub
 /// can install without reaching GitHub: IPv6-only machines cannot resolve
 /// github.com, and neither can blocked networks.
 ///
-/// ponytail: these bytes are relayed unverified, and `install.sh` executes them
-/// as root on every node. Fetched directly from github.com that is TLS's
-/// concern; through the panel's `github_proxy` it rests on the mirror alone.
-/// Currently held by the setting accepting https:// only, and by stating so
-/// where it is entered. The upgrade path is a pinned digest -- `agent.pin`
-/// beside `web-theme.pin`, a fixed release tag, hashed after the fetch and
-/// before the relay (4 permits x 1.73 MiB against MemoryMax=256M, so buffering
-/// is free). Not a fetched checksum: whoever can replace the binary can replace
-/// that too. Deliberately deferred, as it couples agent releases to hub
-/// releases.
+/// What leaves here is checked against [`AGENT_PIN`] first, because
+/// `install.sh` executes these bytes as root on every node. Fetched directly
+/// from github.com that is TLS's concern; through the panel's `github_proxy` it
+/// rests on the mirror alone, and the setting accepting https:// only says
+/// nothing about who is behind it. The digest is pinned in this repository
+/// rather than fetched beside the binary: whoever can replace one can replace
+/// the other.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
     }
+    // Refused rather than relayed unverified. An architecture this route serves
+    // but the pin does not name is a pin somebody edited, and falling back to
+    // the release this route used to fetch would undo exactly this check.
+    let Some(pin) = pinned(&arch) else {
+        warn!("agent.pin names no {arch} release; refusing to relay an unverified binary");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this hub has no pinned agent release for that architecture",
+        )
+            .into_response();
+    };
     let Ok(permit) = RELAY_GATE.try_acquire() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
     };
-    let url = release_url(&app, &arch);
+    let url = release_url(&app, pin.tag, &arch);
     // The default client timeout is sized for API calls, not a 1.8 MB download.
     let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
-    match fetched {
-        // Streamed rather than collected: holding each release in full would put
-        // a few hundred parallel requests within reach of the unit file's memory
-        // ceiling. Passing the bytes through costs one buffer per request.
-        Ok(res) if res.status().is_success() => (
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
-        )
-            .into_response(),
+    let mut res = match fetched {
+        Ok(res) if res.status().is_success() => res,
         Ok(res) => {
-            (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
+            return (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status()))
+                .into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+    };
+
+    // Collected rather than streamed, and bounded while it is read: `bytes()`
+    // would take whatever the upstream chose to send, and the hub now holds the
+    // body whole instead of passing it through.
+    let mut body = Vec::new();
+    loop {
+        match res.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > RELAY_MAX {
+                    warn!("{url} is larger than the {RELAY_MAX}-byte ceiling this relay buffers");
+                    return (StatusCode::BAD_GATEWAY, "the release is larger than this hub will relay")
+                        .into_response();
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response()
+            }
+        }
     }
+
+    let got: [u8; 32] = Sha256::digest(&body).into();
+    if got != pin.digest {
+        warn!(
+            "{url} hashes to {}, not the {} agent.pin names for {arch}; the release asset was \
+             replaced, or the GitHub proxy is not serving it",
+            hex::encode(got),
+            hex::encode(pin.digest)
+        );
+        return (StatusCode::BAD_GATEWAY, "the release does not match the pinned digest").into_response();
+    }
+
+    (
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        axum::body::Body::from_stream(metered(Once(Some(body)), permit)),
+    )
+        .into_response()
 }
 
 // ---- startup ----
@@ -760,6 +898,11 @@ mod tests {
         assert!(app.public_page());
     }
 
+    /// `RELAY_GATE` is one semaphore for the whole process, so a test that holds
+    /// its slots and a test that needs one must not overlap: the second would see
+    /// the gate exhausted and report a refusal that is the first test's doing.
+    static RELAY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A stream that ends immediately, standing in for a release.
     struct Nothing;
 
@@ -780,6 +923,7 @@ mod tests {
     /// byte" is the client's decision -- no longer than RELAY_DEADLINE.
     #[tokio::test(start_paused = true)]
     async fn a_relay_permit_follows_the_body_but_not_past_the_deadline() {
+        let _serial = RELAY_TESTS.lock().await;
         let queued: Vec<_> =
             (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
         let body = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
@@ -811,17 +955,89 @@ mod tests {
     #[test]
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
-        let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/monitor-probe/agent/releases/"), "{direct}");
+        let direct = release_url(&app, "v1.0.0", "x86_64");
+        assert!(
+            direct.starts_with("https://github.com/monitor-probe/agent/releases/download/v1.0.0/"),
+            "{direct}"
+        );
+        assert!(direct.ends_with("monitor-agent-x86_64-unknown-linux-musl"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();
-            assert_eq!(release_url(&app, "x86_64"), format!("https://ghfast.top/{direct}"), "{set:?}");
+            assert_eq!(
+                release_url(&app, "v1.0.0", "x86_64"),
+                format!("https://ghfast.top/{direct}"),
+                "{set:?}"
+            );
         }
         // Cleared in the panel, which stores an empty string rather than removing
         // the row.
         app.db.set("github_proxy", "").unwrap();
-        assert_eq!(release_url(&app, "x86_64"), direct);
+        assert_eq!(release_url(&app, "v1.0.0", "x86_64"), direct);
+    }
+
+    /// The pin is the only thing between a mirror and root on every node that
+    /// installs, so every architecture the route serves must have one. Missing it
+    /// is not a softer failure than a wrong digest -- `agent_binary` refuses
+    /// rather than falling back -- and this is what says so before a node finds
+    /// out.
+    #[test]
+    fn the_pin_names_a_release_for_every_architecture_the_route_serves() {
+        let app = app("");
+        for arch in ["x86_64", "aarch64"] {
+            let pin = pinned(arch).unwrap_or_else(|| panic!("agent.pin has no {arch} release"));
+            assert!(!pin.tag.is_empty(), "{arch}");
+            assert_ne!(pin.digest, [0u8; 32], "{arch}");
+            // The tag is what the URL is built from; a pin that never reaches the
+            // URL would leave GitHub's `latest` deciding what is served.
+            let url = release_url(&app, pin.tag, arch);
+            assert!(url.contains(&format!("/download/{}/", pin.tag)), "{url}");
+            assert!(url.ends_with(&format!("monitor-agent-{arch}-unknown-linux-musl")), "{url}");
+        }
+        // Two architectures, two binaries. One digest for both would relay the
+        // wrong one rather than fail.
+        assert_ne!(pinned("x86_64").unwrap().digest, pinned("aarch64").unwrap().digest);
+        assert!(pinned("riscv64").is_none(), "an architecture with no pin must resolve to none");
+    }
+
+    /// A mirror that answers with anything other than the pinned release must not
+    /// have those bytes relayed -- `install.sh` runs them as root -- and must give
+    /// its permit back, or one bad mirror takes the route down four requests at a
+    /// time.
+    #[tokio::test]
+    async fn a_release_that_does_not_match_the_pin_is_refused_rather_than_relayed() {
+        let _serial = RELAY_TESTS.lock().await;
+        let served: &'static [u8] = b"not the release agent.pin names, and install.sh would run it as root";
+        let mut app = app("");
+        // The proxy variables in this environment would otherwise send a request
+        // to 127.0.0.1 somewhere else entirely.
+        app.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mirror = mock_mirror(served).await;
+        app.db.set("github_proxy", &mirror).unwrap();
+
+        let res = agent_binary(State(Arc::new(app)), Path("x86_64".to_owned())).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        assert!(
+            !body.windows(served.len()).any(|window| window == served),
+            "the mirror's bytes must not reach the caller"
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("pinned digest"),
+            "the refusal must say what it refused for, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(RELAY_GATE.try_acquire().is_ok(), "a refused relay gives its permit back");
+    }
+
+    /// A stand-in for the panel's GitHub proxy: any path, one body.
+    async fn mock_mirror(body: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(move || async move { body })).await;
+        });
+        format!("http://{addr}")
     }
 
     #[test]

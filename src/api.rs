@@ -1599,6 +1599,13 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
+    /// `HISTORY_GATE` is one semaphore for the whole process, so the test that
+    /// fills it and a test that needs a slot from it must not overlap: the second
+    /// is refused by the first and reads that refusal as the behaviour under
+    /// test. Observed before this existed -- `history` tests failed roughly one
+    /// run in three, with the gate's plain-text refusal handed to a JSON parser.
+    static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn provisioning_requires_the_current_https_domain_entry() {
         let no_site = app();
@@ -2421,6 +2428,7 @@ mod tests {
     /// that make this process work hard.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let ask = || {
@@ -2517,6 +2525,7 @@ mod tests {
     /// every row behind it holding the write connection.
     #[tokio::test]
     async fn an_anonymous_history_window_stops_at_a_week() {
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
