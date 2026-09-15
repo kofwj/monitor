@@ -5,6 +5,7 @@
 //! leaving no config file to track and no secrets in plaintext TOML.
 
 mod agent_ws;
+mod alerts;
 mod api;
 mod auth;
 mod db;
@@ -507,6 +508,10 @@ async fn main() -> Result<()> {
     }
 
     tokio::spawn(housekeeping(app.clone()));
+    // Its own timer rather than a step in `housekeeping`: that one ticks hourly,
+    // and an offline node announced within the hour is an offline node announced
+    // after whatever it was hosting had already been down for an hour.
+    tokio::spawn(alerts::run(app.clone()));
 
     let router = Router::new()
         // Agents.
@@ -536,6 +541,7 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route("/api/alerts/test", post(alerts::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))

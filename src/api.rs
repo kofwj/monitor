@@ -950,7 +950,8 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 }
 
 /// Settings the panel may read. Secrets are deliberately excluded: the client can
-/// set the GitHub secret but never read it back.
+/// set the GitHub secret and the Telegram bot token but never read either back,
+/// and each reports whether it is set instead.
 const READABLE_SETTINGS: &[&str] = &[
     "site_name",
     "public_page",
@@ -959,6 +960,14 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    // The alert thresholds, from the module that reads them: a key listed there
+    // and not here is one the alert page could never load.
+    "alert_telegram_chat",
+    "alert_offline_minutes",
+    "alert_traffic_percent",
+    "alert_expiry_days",
+    "alert_resource_percent",
+    "alert_resource_minutes",
 ];
 
 // ---- the database itself ----
@@ -1496,6 +1505,12 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
     );
+    // Write-only for the same reason, and reported the same way: the alert page
+    // needs to say "已设置，留空不变" without ever holding the credential.
+    out.insert(
+        "alert_telegram_set".into(),
+        json!(app.db.get("alert_telegram_token").is_some_and(|v| !v.is_empty())),
+    );
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
     // both names.
@@ -1539,9 +1554,46 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
+        // The bot token is write-only, so it is not in `READABLE_SETTINGS`; the
+        // shape is checked here because nothing but Telegram ever sees the value,
+        // and a token with a character missing fails as a bare 404 from an
+        // endpoint that does not name the setting responsible.
+        "alert_telegram_token" if !(value.is_empty() || crate::alerts::token_ok(value)) => {
+            Some("Bot Token 形如 123456789:AA…，请从 @BotFather 整条复制".into())
+        }
+        "alert_telegram_token" => None,
+        // A chat the bot has not been added to is a 400 from Telegram and nothing
+        // in the hub's own log, which is the same failure with a worse message.
+        "alert_telegram_chat" if !(value.is_empty() || crate::alerts::chat_ok(value)) => {
+            Some("Chat ID 是数字（群组为负数）或 @频道名".into())
+        }
+        // Every threshold is a whole number of minutes, percent or days, and zero
+        // is off -- the same way a node with a traffic limit of zero has no limit.
+        // An empty value is how the panel clears one, and reads as zero.
+        "alert_offline_minutes" if !threshold(value, 0, 10_080) => {
+            Some("离线阈值是 0 到 10080 之间的分钟数，0 表示关闭".into())
+        }
+        "alert_traffic_percent" if !threshold(value, 0, 100) => {
+            Some("流量阈值是 0 到 100 之间的百分数，0 表示关闭".into())
+        }
+        "alert_expiry_days" if !threshold(value, 0, 365) => {
+            Some("到期提醒是 0 到 365 之间的天数，0 表示关闭".into())
+        }
+        "alert_resource_percent" if !threshold(value, 0, 100) => {
+            Some("占用阈值是 0 到 100 之间的百分数，0 表示关闭".into())
+        }
+        "alert_resource_minutes" if !threshold(value, 0, 1_440) => {
+            Some("持续时间是 0 到 1440 之间的分钟数，0 表示首次采样即告警".into())
+        }
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
+}
+
+/// A whole number inside `lo..=hi`, or the empty string the panel sends when a
+/// field is cleared -- which every threshold reads as zero.
+fn threshold(value: &str, lo: i64, hi: i64) -> bool {
+    value.is_empty() || value.parse::<i64>().is_ok_and(|n| (lo..=hi).contains(&n))
 }
 
 pub async fn save_settings(
@@ -2685,6 +2737,65 @@ mod tests {
         assert_eq!(body["github_secret_set"], true);
         assert!(body.get("github_client_secret").is_none());
         assert!(!body.to_string().contains("super-secret"));
+    }
+
+    /// The alert page and this route keep separate lists of the same keys, and
+    /// each way they can disagree is silent: a key this route does not recognise
+    /// is a field that can be typed into and never saved, and one it does not hand
+    /// back is a field that reloads blank however many times it is saved.
+    #[tokio::test]
+    async fn the_alert_page_and_the_settings_route_agree_on_which_keys_exist() {
+        let app = app();
+        for key in crate::alerts::SETTINGS {
+            assert!(
+                setting_error(&app, key, &json!("")).is_none(),
+                "{key} is written by the alert page and refused as an unknown setting"
+            );
+            assert!(
+                key == "alert_telegram_token" || READABLE_SETTINGS.contains(&key),
+                "{key} is saved by the alert page and never handed back"
+            );
+        }
+        // And the one secret among them reports that it is set without being it.
+        app.db.set("alert_telegram_token", "1:abcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+        let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
+        assert_eq!(body["alert_telegram_set"], true);
+        assert!(!body.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    /// A token that is nearly right fails at Telegram as a bare 404 naming
+    /// nothing, and the alert is then simply never delivered. Refused here, where
+    /// the message can say which field is wrong.
+    #[test]
+    fn an_alert_setting_out_of_range_or_misshapen_is_refused_rather_than_stored() {
+        let app = app();
+        let bad = |key: &str, value: &str| setting_error(&app, key, &json!(value)).is_some();
+
+        assert!(!bad("alert_telegram_token", "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"));
+        assert!(!bad("alert_telegram_token", ""));
+        assert!(bad("alert_telegram_token", "123456789:AAHdqTcvCH1vGWJxfSeo"));
+        assert!(bad("alert_telegram_token", "nonsense"));
+
+        assert!(!bad("alert_telegram_chat", "-1001234567890"));
+        assert!(!bad("alert_telegram_chat", ""));
+        assert!(bad("alert_telegram_chat", "alerts"));
+
+        // Zero is off and is the default, so it has to be storable.
+        for key in [
+            "alert_offline_minutes",
+            "alert_traffic_percent",
+            "alert_expiry_days",
+            "alert_resource_percent",
+            "alert_resource_minutes",
+        ] {
+            assert!(!bad(key, "0"), "{key}");
+            assert!(!bad(key, ""), "{key} cleared");
+        }
+        assert!(bad("alert_offline_minutes", "-1"), "a negative threshold means nothing");
+        assert!(bad("alert_offline_minutes", "10081"));
+        assert!(bad("alert_offline_minutes", "5m"));
+        assert!(bad("alert_traffic_percent", "101"));
+        assert!(bad("alert_resource_minutes", "1441"));
     }
 
     /// The ceiling the agent path already had, applied to the panel path. These

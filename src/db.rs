@@ -444,6 +444,20 @@ pub struct Traffic {
     pub day_tx: i64,
 }
 
+/// What one rule last decided about one node; see the `alert_state` table.
+///
+/// `state` is the rule's own vocabulary -- `offline`, `warn`, `over` -- and empty
+/// means there is nothing to report. `since` is when it was entered, so a
+/// duration is measured from the transition rather than from the last report,
+/// and `notified` is when the operator was last told, zero while they have not
+/// been.
+#[derive(Debug, Clone)]
+pub struct AlertState {
+    pub state: String,
+    pub since: i64,
+    pub notified: i64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PingTask {
     #[serde(default)]
@@ -804,6 +818,73 @@ impl Db {
             ))
         });
         rows.map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+
+    // ---- alerts ----
+
+    /// Every rule's last decision, keyed by node and kind.
+    ///
+    /// One query for the whole pass rather than one per node per rule: this runs
+    /// on a timer beside the agents' writes, and a hub with two hundred nodes
+    /// asking six questions each would queue them behind it.
+    pub fn alert_states(&self) -> Result<HashMap<(i64, String), AlertState>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT node_id, kind, state, since, notified FROM alert_state")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, i64>(0)?, r.get::<_, String>(1)?),
+                AlertState { state: r.get(2)?, since: r.get(3)?, notified: r.get(4)? },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Records what a rule decided about a node. `notified` is zero while the
+    /// decision has not reached the operator, which is what makes the next pass
+    /// send it again.
+    pub fn set_alert_state(
+        &self,
+        node: i64,
+        kind: &str,
+        state: &str,
+        since: i64,
+        notified: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO alert_state (node_id, kind, state, since, notified) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(node_id, kind) DO UPDATE SET
+               state = excluded.state, since = excluded.since, notified = excluded.notified",
+            params![node, kind, state, since, notified],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a decision as told. Written after the message is away rather than
+    /// with the decision, because between the two is an HTTP request that can
+    /// fail: a row written told before it was sent would drop the alert.
+    pub fn alert_notified(&self, node: i64, kind: &str, ts: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE alert_state SET notified = ?3 WHERE node_id = ?1 AND kind = ?2",
+            params![node, kind, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Drops what a rule remembers, so that switching it back on announces the
+    /// conditions that hold now -- a node that is down, a quota already passed --
+    /// rather than waiting for each to happen a second time. `None` forgets every
+    /// rule, which is what a hub with no bot configured does.
+    pub fn forget_alerts(&self, kind: Option<&str>) -> Result<()> {
+        match kind {
+            Some(kind) => {
+                self.conn().execute("DELETE FROM alert_state WHERE kind = ?1", [kind])?;
+            }
+            None => {
+                self.conn().execute("DELETE FROM alert_state", [])?;
+            }
+        }
+        Ok(())
     }
 
     /// Folds one report's raw kernel counters into the node's running totals.
