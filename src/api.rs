@@ -7,7 +7,7 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Local, Utc};
+use chrono::{Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
@@ -501,6 +501,89 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
+/// Longest a text field the panel writes may be.
+///
+/// `name`, `currency`, `billing_cycle` and `expires_at` all reach the anonymous
+/// public frame, which is rebuilt and pushed to every viewer every two seconds,
+/// so one node would otherwise determine that frame's size -- the same ceiling
+/// `db::save_facts` applies to what an agent reports, and for the reason stated
+/// there. The agent path was bounded from the start and the panel path was not:
+/// a 64 KiB name, the router's whole body limit, was accepted and then served to
+/// every anonymous visitor. `remark` is panel-only but rides the admin frame on
+/// the same two-second tick.
+///
+/// 64 matches what `agent_register` allows a machine to name itself, so a node
+/// registered automatically and one added by hand are bounded alike.
+const MAX_NAME: usize = 64;
+const MAX_CURRENCY: usize = 8;
+const MAX_REMARK: usize = 256;
+
+/// The billing cycles `main::cycle_months` knows. A value outside this set is
+/// not merely unusual: `cycle_months` returns nothing for it, so
+/// `renew_online_nodes` skips the node forever and an expiry date already past
+/// is never rolled forward, with nothing logged and the panel still displaying
+/// whatever was typed. Refused rather than stored, for the reason
+/// `save_ping_task` gives for the probe interval. Kept in step with `CYCLES` in
+/// `web-admin/src/lib/format.ts`, which is the only set the panel offers.
+const BILLING_CYCLES: [&str; 7] =
+    ["monthly", "quarterly", "semiannual", "yearly", "biennial", "triennial", "once"];
+
+/// Why the text fields one panel write carries cannot be stored, or `None` when
+/// they can. `None` for a field means the write did not mention it.
+///
+/// Shared by both writers, because a rule enforced on one is not a rule:
+/// `update_node` reaching a value `create_node` refuses leaves it reachable by
+/// another route, which is the mistake `node_limits` above was extracted to fix.
+///
+/// Length is counted in `chars` rather than bytes, so the ceiling falls on a
+/// character boundary. Control characters are refused rather than stripped:
+/// silently altering what was typed would store a name nobody chose, and the
+/// panel's own input is not the only client.
+fn node_text_error(
+    name: Option<&str>,
+    currency: Option<&str>,
+    billing_cycle: Option<&str>,
+    expires_at: Option<&str>,
+    remark: Option<&str>,
+) -> Option<String> {
+    let bounded = |field: &str, value: &str, max: usize| -> Option<String> {
+        if value.chars().count() > max {
+            return Some(format!("{field} must be at most {max} characters"));
+        }
+        value.chars().any(char::is_control).then(|| format!("{field} must not contain control characters"))
+    };
+    if let Some(value) = name {
+        if let Some(e) = bounded("name", value, MAX_NAME) {
+            return Some(e);
+        }
+    }
+    if let Some(value) = currency {
+        if let Some(e) = bounded("currency", value, MAX_CURRENCY) {
+            return Some(e);
+        }
+    }
+    if let Some(value) = billing_cycle {
+        if !BILLING_CYCLES.contains(&value) {
+            return Some(format!("billing cycle must be one of {}", BILLING_CYCLES.join(", ")));
+        }
+    }
+    // An empty string is the panel clearing the field, and `update_node` sends
+    // null for that; either way there is no date to check. The panel displays
+    // this column verbatim, so a value that is not a date is visible rather than
+    // hidden -- and `renew_online_nodes` would silently never match it.
+    if let Some(value) = expires_at.filter(|v| !v.is_empty()) {
+        if value.parse::<NaiveDate>().is_err() {
+            return Some("expiry date must be YYYY-MM-DD".into());
+        }
+    }
+    if let Some(value) = remark {
+        if let Some(e) = bounded("remark", value, MAX_REMARK) {
+            return Some(e);
+        }
+    }
+    None
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
@@ -527,7 +610,11 @@ pub async fn create_node(
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
-    if node.name.trim().is_empty() {
+    // Trimmed before it is measured, so trailing whitespace does not count
+    // against the ceiling and a name of nothing but spaces is refused as empty
+    // rather than as over-long.
+    node.name = node.name.trim().to_owned();
+    if node.name.is_empty() {
         return bad("name is required");
     }
     if let Some(message) =
@@ -535,7 +622,15 @@ pub async fn create_node(
     {
         return bad(message);
     }
-    node.name = node.name.trim().to_owned();
+    if let Some(message) = node_text_error(
+        Some(&node.name),
+        Some(&node.currency),
+        Some(&node.billing_cycle),
+        node.expires_at.as_deref(),
+        Some(&node.remark),
+    ) {
+        return bad(&message);
+    }
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install command is readable from the node list,
@@ -674,6 +769,18 @@ pub async fn update_node(
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
         return bad(message);
+    }
+    // The same rules the create path applies, over whichever fields this patch
+    // carries. Enforced on both because a value `create_node` refuses must not
+    // be reachable through `update_node`.
+    if let Some(message) = node_text_error(
+        node.name.as_deref(),
+        node.currency.as_deref(),
+        node.billing_cycle.as_deref(),
+        node.expires_at.as_ref().and_then(|v| v.as_deref()),
+        node.remark.as_deref(),
+    ) {
+        return bad(&message);
     }
     match app.db.update_node(id, &node) {
         Ok(()) => {
@@ -2569,5 +2676,115 @@ mod tests {
         assert_eq!(body["github_secret_set"], true);
         assert!(body.get("github_client_secret").is_none());
         assert!(!body.to_string().contains("super-secret"));
+    }
+
+    /// The ceiling the agent path already had, applied to the panel path. These
+    /// fields reach the anonymous public frame, which is rebuilt and pushed to
+    /// every viewer every two seconds, so one node would otherwise determine its
+    /// size -- the reason `db::save_facts` gives for bounding what an agent
+    /// reports.
+    #[test]
+    fn panel_text_is_bounded_before_it_reaches_the_public_frame() {
+        assert!(node_text_error(Some(&"A".repeat(MAX_NAME)), None, None, None, None).is_none());
+        assert!(node_text_error(Some(&"A".repeat(MAX_NAME + 1)), None, None, None, None).is_some());
+        assert!(node_text_error(None, Some("<script>alert(1)</script>"), None, None, None).is_some());
+        assert!(node_text_error(None, Some("USD"), None, None, None).is_none());
+        assert!(node_text_error(None, None, None, None, Some(&"r".repeat(MAX_REMARK + 1))).is_some());
+
+        // Counted in characters, so a name at the ceiling in characters is
+        // accepted whatever it costs in bytes. Without this the guard would
+        // refuse names it has no reason to refuse.
+        let cjk: String = std::iter::repeat_n('测', MAX_NAME).collect();
+        assert!(cjk.len() > MAX_NAME, "the case must exercise the byte/char difference");
+        assert!(node_text_error(Some(&cjk), None, None, None, None).is_none());
+
+        // Control characters break the panel's rows, exactly as they would from
+        // an agent. Refused rather than stripped: stripping would store a name
+        // nobody typed.
+        for (name, remark) in [(Some("a\nb"), None), (Some("a\u{7f}b"), None), (None, Some("a\tb"))] {
+            assert!(node_text_error(name, None, None, None, remark).is_some(), "{name:?} {remark:?}");
+        }
+    }
+
+    /// `main::cycle_months` knows a fixed set, and a value outside it does not
+    /// fail: it stops `renew_online_nodes` from ever rolling the node's expiry
+    /// forward, silently and with nothing logged, while the panel goes on
+    /// displaying what was typed.
+    #[test]
+    fn an_unknown_billing_cycle_is_refused_rather_than_stored() {
+        for known in BILLING_CYCLES {
+            assert!(node_text_error(None, None, Some(known), None, None).is_none(), "{known}");
+        }
+        for unknown in ["every-other-tuesday", "", "Monthly", "month", "once "] {
+            assert!(node_text_error(None, None, Some(unknown), None, None).is_some(), "{unknown:?}");
+        }
+    }
+
+    /// The panel renders this column verbatim and `renew_online_nodes` parses it,
+    /// so a value that is not a date is both visible and permanently inert.
+    #[test]
+    fn an_expiry_date_that_is_not_a_date_is_refused() {
+        assert!(node_text_error(None, None, None, Some("2026-09-15"), None).is_none());
+        // Cleared: the panel sends null for an emptied field, and an empty
+        // string means the same thing.
+        assert!(node_text_error(None, None, None, Some(""), None).is_none());
+        assert!(node_text_error(None, None, None, None, None).is_none());
+        for bad in ["not-a-date-at-all", "2026-13-01", "15/09/2026", "2026-09-15x", "2026-02-30"] {
+            assert!(node_text_error(None, None, None, Some(bad), None).is_some(), "{bad:?}");
+        }
+    }
+
+    /// Enforced by the handlers rather than by the helper alone, on both writers:
+    /// a rule `create_node` applies and `update_node` does not is not a rule, and
+    /// `update_node` is where a refused value would otherwise stay reachable.
+    #[tokio::test]
+    async fn a_node_the_panel_writes_is_bounded_like_one_that_registers_itself() {
+        let app = std::sync::Arc::new(app());
+        let headers = domain_headers();
+        let create = |body: serde_json::Value| {
+            let node = serde_json::from_value::<Node>(body).unwrap();
+            create_node(Admin, State(app.clone()), headers.clone(), Ok(Json(node)))
+        };
+
+        let refused = create(json!({"name": "A".repeat(MAX_NAME + 1)})).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(app.db.nodes().unwrap().is_empty(), "a refused node must not be stored");
+
+        // Exactly what the panel sends for a complete node.
+        let created = create(json!({
+            "name": "东京-01",
+            "currency": "CNY",
+            "billing_cycle": "quarterly",
+            "expires_at": "2026-12-01",
+            "remark": "商家、用途",
+        }))
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let node = app.db.nodes().unwrap().remove(0);
+        assert_eq!(node.name, "东京-01");
+        assert_eq!(node.expires_at.as_deref(), Some("2026-12-01"));
+
+        let patch = |body: serde_json::Value| {
+            let patch = serde_json::from_value::<NodePatch>(body).unwrap();
+            update_node(Admin, State(app.clone()), Path(node.id), Ok(Json(patch)))
+        };
+        for bad in [
+            json!({"name": "A".repeat(MAX_NAME + 1)}),
+            json!({"currency": "<script>alert(1)</script>"}),
+            json!({"billing_cycle": "every-other-tuesday"}),
+            json!({"expires_at": "not-a-date-at-all"}),
+            json!({"remark": "r".repeat(MAX_REMARK + 1)}),
+        ] {
+            assert_eq!(patch(bad.clone()).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(app.db.nodes().unwrap()[0].name, "东京-01", "a refused patch must change nothing");
+
+        // A patch carrying none of those fields still lands, so the guards did
+        // not make the form uneditable.
+        assert_eq!(patch(json!({"sort": 3})).await.status(), StatusCode::OK);
+        assert_eq!(app.db.nodes().unwrap()[0].sort, 3);
+        // And clearing the expiry date stays possible.
+        assert_eq!(patch(json!({"expires_at": null})).await.status(), StatusCode::OK);
+        assert!(app.db.nodes().unwrap()[0].expires_at.is_none());
     }
 }
