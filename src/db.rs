@@ -117,12 +117,35 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+-- What each alert rule last decided about each node.
+--
+-- Notifications go out when the answer *changes*, so the previous answer has to
+-- outlive the process: held in memory, every hub restart would re-announce every
+-- node that was offline at the time, and a hub that restarts twice would say so
+-- twice. `ON DELETE CASCADE` is what keeps a removed node from leaving a row
+-- that a later id could inherit, the same reason `traffic` carries it.
+CREATE TABLE IF NOT EXISTS alert_state (
+  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+  -- offline | traffic | expiry | cpu | mem | disk
+  kind    TEXT    NOT NULL,
+  -- The state the rule is in, compared against next evaluation. Empty means
+  -- "nothing to report", which is where a node that has never alarmed starts.
+  state   TEXT    NOT NULL,
+  -- Unix seconds that state was entered, so "offline for 4m12s" is measured from
+  -- the transition rather than from the last report.
+  since   INTEGER NOT NULL DEFAULT 0,
+  -- Unix seconds of the last notification. `expiry` reads its local date to
+  -- remind once a day; the rest use it only to recognise a repeat.
+  notified INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (node_id, kind)
+) WITHOUT ROWID;
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -219,6 +242,29 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
 }
 
+/// `alert_state` arrives with 4. A database this build creates for itself gets it
+/// from `SCHEMA`, so for the live file this is a no-op; a v3 upload does not, and
+/// `check_backup` runs the migrations before the copy rather than after, so
+/// without this the restore of any backup predating 4 is refused.
+///
+/// The DDL is restated here rather than shared with `SCHEMA`, which is what
+/// migrations are: the shape as of the version being reached, frozen once
+/// shipped. `SCHEMA` tracks whatever the current shape is, so a column added to
+/// this table later reaches an old file through a `migrate_to_5` instead.
+fn migrate_to_4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS alert_state (
+           node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+           kind    TEXT    NOT NULL,
+           state   TEXT    NOT NULL,
+           since   INTEGER NOT NULL DEFAULT 0,
+           notified INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY (node_id, kind)
+         ) WITHOUT ROWID;",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -235,13 +281,40 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 3 {
         migrate_to_3(conn)?;
     }
+    if from < 4 {
+        migrate_to_4(conn)?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
 
-/// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
+/// The tables a hub database has carried since the first stamped schema, and
+/// therefore what tells a backup from an unrelated SQLite file.
+///
+/// A table a later migration added is deliberately absent: a backup old enough to
+/// predate one is still a backup, and [`migrate`] is what supplies it. Checking
+/// the full [`TABLES`] here would refuse every backup taken before the newest
+/// table existed, which is the whole of what a restore is for.
+const BACKUP_TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+
+/// Every table this build's schema carries: [`BACKUP_TABLES`] plus whatever a
+/// migration since has added. `stats()` reports a row count for each, and
+/// `check_backup` compares each one's columns once the file is up to date.
+/// `the_backup_gate_asks_for_the_tables_every_version_has_carried` keeps the two
+/// lists in step, and `every_table_the_stats_report_is_one_the_schema_creates`
+/// keeps this one in step with `SCHEMA`.
+const TABLES: [&str; 9] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "alert_state",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1329,7 +1402,11 @@ impl Db {
         if plotted > 0 {
             anyhow::bail!("the file carries views or triggers, which a hub backup never does");
         }
-        for table in TABLES {
+        // Asked of `BACKUP_TABLES` rather than of `TABLES`, and asked before
+        // anything writes to the file: this is the gate that decides whether the
+        // upload is this application's backup at all, so it cannot be the
+        // migration below that creates the table it is looking for.
+        for table in BACKUP_TABLES {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -1364,8 +1441,8 @@ impl Db {
 
         // Table names are not a schema. Pages are copied verbatim, so the columns
         // the file carries become the ones this hub's statements run against, and
-        // eight correctly named tables holding the wrong columns pass every gate
-        // above while leaving the database unusable.
+        // a table of each expected name holding the wrong columns passes every
+        // gate above while leaving the database unusable.
         //
         // Compared against a database this build creates for itself, so there is
         // no second column list to keep in step with `SCHEMA`. Names are compared
@@ -1663,9 +1740,9 @@ mod tests {
             .unwrap();
         assert!(db.check_backup(&bad).is_err(), "a view where a table belongs");
 
-        // Eight tables with the right names and none of the right columns. Every
-        // gate above passes: it is a healthy SQLite file, it carries no view or
-        // trigger, all eight names are present, it stamps itself with this build's
+        // Every expected table with the right name and none of the right columns.
+        // Every gate above passes: it is a healthy SQLite file, it carries no view
+        // or trigger, all the names are present, it stamps itself with this build's
         // version and uses the same page size. Restoring copies pages, so those
         // columns would become the ones the hub runs every statement against,
         // leaving the panel reporting a failed restore over a database already
@@ -1690,6 +1767,68 @@ mod tests {
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
         db.check_backup(&bad).unwrap();
+    }
+
+    /// A backup taken before the newest table existed is the ordinary case, not an
+    /// edge one: it is what every hub that has been running for longer than one
+    /// release uploads. The table arrives with the migration rather than being
+    /// demanded of the file, so a v3 backup is refused only for the reasons a
+    /// current one would be.
+    #[test]
+    fn a_backup_taken_before_alert_state_existed_still_restores() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let bad = format!("{}.copy", scratch.0);
+
+        // A database as a v3 hub left it: every table of the time, and no
+        // `alert_state`. Built by dropping what a v3 hub never had rather than by
+        // restating a v3 schema here, so it cannot drift from the real one.
+        let old = Connection::open(&bad).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch("DROP TABLE alert_state; PRAGMA user_version = 3;").unwrap();
+        drop(old);
+
+        db.check_backup(&bad).unwrap();
+        // Not merely accepted: brought up to this build's schema, which is what the
+        // restore then copies over the live file.
+        let migrated = Connection::open(&bad).unwrap();
+        let columns = columns_of(&migrated, "alert_state").unwrap();
+        for column in ["node_id", "kind", "state", "since", "notified"] {
+            assert!(columns.contains(column), "alert_state has no {column}: {columns:?}");
+        }
+        drop(migrated);
+
+        db.restore_from(&bad).unwrap();
+        let kept: i64 = db.conn().query_row("SELECT COUNT(*) FROM alert_state", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 0, "a restored hub starts with nothing recorded");
+
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    /// `stats()` runs `SELECT COUNT(*) FROM {table}` for every entry, so a name
+    /// there that `SCHEMA` does not create is a panic on the data page rather than
+    /// a missing figure. Asserted because the two lists are edited separately.
+    #[test]
+    fn every_table_the_stats_report_is_one_the_schema_creates() {
+        for table in TABLES {
+            assert!(
+                SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table} ")),
+                "{table} is counted by stats() but SCHEMA does not create it"
+            );
+        }
+    }
+
+    /// The gate in `check_backup` asks `BACKUP_TABLES`; the column comparison and
+    /// `stats()` ask `TABLES`. A table in the first but not the second would never
+    /// have its columns checked; a table in the second but not the first has to be
+    /// one a migration supplies, or every backup predating it is refused.
+    #[test]
+    fn the_backup_gate_asks_for_the_tables_every_version_has_carried() {
+        assert_eq!(TABLES[..BACKUP_TABLES.len()], BACKUP_TABLES[..]);
+        // Which is to say: `alert_state` is the only table a migration adds, and
+        // `migrate_to_4` is the only thing that can put it in an old file.
+        assert_eq!(TABLES.len(), BACKUP_TABLES.len() + 1);
+        assert_eq!(TABLES[BACKUP_TABLES.len()], "alert_state");
     }
 
     /// `oldest` is what the data page compares against the retention window, so it
