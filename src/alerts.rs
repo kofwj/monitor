@@ -211,7 +211,7 @@ impl Pass<'_> {
         if connected || node.last_seen == 0 || silent < threshold {
             return Some(Finding::quiet("offline"));
         }
-        Some(Finding::raise("offline", "offline", format!("🔴 已离线 {}", human(silent))))
+        Some(Finding::raise("offline", "offline", format!("已离线 {}", human(silent))))
     }
 
     /// This period's usage against the node's quota.
@@ -239,8 +239,8 @@ impl Pass<'_> {
         };
         let spent = format!("{} / {}", bytes(used), bytes(node.traffic_limit));
         let line = match state {
-            "over" => format!("🔴 本月流量已用尽 {spent}（{percent}%）"),
-            _ => format!("🟠 本月流量 {spent}（{percent}%）"),
+            "over" => format!("本月流量已用尽 {spent}（{percent}%）"),
+            _ => format!("本月流量 {spent}（{percent}%）"),
         };
         Some(Finding::raise("traffic", state, line))
     }
@@ -269,7 +269,7 @@ impl Pass<'_> {
             0 => format!("今天到期（{expires}）"),
             d => format!("{d} 天后到期（{expires}）"),
         };
-        Some(Finding::raise("expiry", "soon", format!("🔵 {when}")))
+        Some(Finding::raise("expiry", "soon", when))
     }
 
     /// A live reading against the operator's threshold, once it has held for
@@ -309,7 +309,7 @@ impl Pass<'_> {
             0 => String::new(),
             m => format!("（持续 {m} 分钟）"),
         };
-        Some(Finding::raise(kind, "over", format!("🟡 {name} {percent:.0}%{held_for}")))
+        Some(Finding::raise(kind, "over", format!("{name} {percent:.0}%{held_for}")))
     }
 }
 
@@ -565,8 +565,8 @@ fn told_before_today(stored: &AlertState, now: i64) -> bool {
 /// lasted. Only [`clears`] reaches here, so there is one kind to word.
 fn clear_line(finding: &Finding, stored: Option<&AlertState>, now: i64) -> String {
     match stored.map(|s| human(now.saturating_sub(s.since))) {
-        Some(away) => format!("🟢 {} 已恢复（离线 {away}）", finding.label),
-        None => format!("🟢 {} 已恢复", finding.label),
+        Some(away) => format!("{} 已恢复（离线 {away}）", finding.label),
+        None => format!("{} 已恢复", finding.label),
     }
 }
 
@@ -763,7 +763,7 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
     if !rules.addressed() {
         return (StatusCode::BAD_REQUEST, "先填写 Bot Token 和 Chat ID").into_response();
     }
-    let text = "🟢 monitor-hub 测试消息\n收到这条说明告警已经接通。";
+    let text = "monitor-hub 测试消息\n收到这条说明告警已经接通。";
     match send(&app.http, TELEGRAM_API, &rules, text).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         // Telegram's refusal, not a generic one: it is the only thing that says
@@ -905,7 +905,7 @@ mod tests {
         n.last_seen = now - 5 * 60;
         let found = p.offline(&n, false).unwrap();
         assert_eq!(found.state, "offline");
-        assert_eq!(found.line, "🔴 已离线 5 分钟");
+        assert_eq!(found.line, "已离线 5 分钟");
 
         // Connected, whatever `last_seen` says: the map of agents is the fact.
         assert_eq!(p.offline(&n, true).unwrap().state, "");
@@ -968,7 +968,7 @@ mod tests {
         };
         assert_eq!(at(1_000, 700).state, "");
         assert_eq!(at(1_000, 800).state, "warn");
-        assert_eq!(at(1_000, 800).line, "🟠 本月流量 800 B / 1000 B（80%）");
+        assert_eq!(at(1_000, 800).line, "本月流量 800 B / 1000 B（80%）");
         assert_eq!(at(1_000, 999).state, "warn");
         assert_eq!(at(1_000, 1_000).state, "over");
         assert_eq!(at(1_000, 1_400).state, "over");
@@ -1004,7 +1004,7 @@ mod tests {
         n.expires_at = Some("2026-09-18".into());
         let soon = p.expiry(&n).unwrap();
         assert_eq!(soon.state, "soon");
-        assert_eq!(soon.line, "🔵 3 天后到期（2026-09-18）");
+        assert_eq!(soon.line, "3 天后到期（2026-09-18）");
 
         n.expires_at = Some("2026-09-15".into());
         assert!(p.expiry(&n).unwrap().line.contains("今天到期"));
@@ -1058,7 +1058,7 @@ mod tests {
         let held = holding("cpu", "high", now - 300);
         let over = pass(&rules, &held, now).resource(&node("web"), Some(&hot), "cpu").unwrap();
         assert_eq!(over.state, "over");
-        assert_eq!(over.line, "🟡 CPU 99%（持续 5 分钟）");
+        assert_eq!(over.line, "CPU 99%（持续 5 分钟）");
 
         // Cooled down, and a node that stopped reporting: both clear the state, so
         // a reconnect measures the minutes again rather than counting the silence
@@ -1071,7 +1071,7 @@ mod tests {
         let now_rules = Rules { resource_minutes: 0, ..rules.clone() };
         let immediate = pass(&now_rules, &empty, now).resource(&node("web"), Some(&hot), "cpu").unwrap();
         assert_eq!(immediate.state, "over");
-        assert_eq!(immediate.line, "🟡 CPU 99%");
+        assert_eq!(immediate.line, "CPU 99%");
     }
 
     /// The whole reason for the table: a condition that is still true on the next
@@ -1098,7 +1098,7 @@ mod tests {
         let states = app.db.alert_states().unwrap();
         let back = record(&app, &states, vec![find("")], now + 600).unwrap();
         assert_eq!(back.len(), 1);
-        assert_eq!(back[0].line, "🟢 web 已恢复（离线 10 分钟）");
+        assert_eq!(back[0].line, "web 已恢复（离线 10 分钟）");
         app.db.alert_notified(id, "offline", now + 600).unwrap();
 
         // And the quiet that follows is not news either.
@@ -1190,25 +1190,25 @@ mod tests {
             Finding {
                 kind: "expiry",
                 state: "soon",
-                line: "🔵 db 3 天后到期".into(),
+                line: "db 3 天后到期".into(),
                 ..Finding::quiet("expiry")
             },
             Finding {
                 kind: "offline",
                 state: "offline",
-                line: "🔴 web 已离线 5 分钟".into(),
+                line: "web 已离线 5 分钟".into(),
                 ..Finding::quiet("offline")
             },
             Finding {
                 kind: "offline",
                 state: "",
-                line: "🟢 api 已恢复（离线 9 分钟）".into(),
+                line: "api 已恢复（离线 9 分钟）".into(),
                 ..Finding::quiet("offline")
             },
             Finding {
                 kind: "traffic",
                 state: "warn",
-                line: "🟠 db 本月流量 80%".into(),
+                line: "db 本月流量 80%".into(),
                 ..Finding::quiet("traffic")
             },
         ];
@@ -1231,7 +1231,7 @@ mod tests {
                 node: i,
                 kind: "offline",
                 state: "offline",
-                line: format!("🔴 node-{i:04} 已离线 5 分钟"),
+                line: format!("node-{i:04} 已离线 5 分钟"),
                 ..Finding::quiet("offline")
             })
             .collect();
@@ -1364,8 +1364,11 @@ mod tests {
             assert_eq!(body["link_preview_options"]["is_disabled"], true);
             let text = body["text"].as_str().unwrap();
             assert!(text.starts_with("<b>离线</b>\n"), "{text}");
-            assert!(text.contains("web"), "{text}");
-            assert!(text.contains("已离线 10 分钟"), "{text}");
+            // The line as it lands, exactly: the node's name, then the wording,
+            // and nothing in front of either. A status prefix here is one the
+            // panel does not draw beside the same node, and the two are read side
+            // by side -- so the whole message is pinned rather than its parts.
+            assert_eq!(text, "<b>离线</b>\nweb 已离线 10 分钟\n");
         }
 
         // Told once. The node is still down and the operator already knows.
