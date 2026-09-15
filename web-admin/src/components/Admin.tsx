@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { BellRing, CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -1294,6 +1294,128 @@ function Sessions() {
   )
 }
 
+// Every threshold is a number the hub reads as "off" when it is zero, the same
+// way a node with a traffic limit of zero has no limit. An emptied field saves as
+// "", which the hub reads as zero too, so clearing one is how a rule is switched
+// off without the field disappearing.
+const ALERT_THRESHOLDS = [
+  { key: "alert_offline_minutes", label: "离线超过", unit: "分钟", placeholder: "5" },
+  { key: "alert_traffic_percent", label: "流量超过套餐的", unit: "%", placeholder: "80" },
+  { key: "alert_expiry_days", label: "到期前", unit: "天", placeholder: "7" },
+  { key: "alert_resource_percent", label: "CPU / 内存 / 硬盘超过", unit: "%", placeholder: "90" },
+  { key: "alert_resource_minutes", label: "且持续", unit: "分钟", placeholder: "5" },
+] as const
+
+function Alerts() {
+  const { s, set, save } = useSettings()
+  const [testing, setTesting] = useState(false)
+  if (!s) return null
+
+  // `||` rather than `??`: the hub returns "" for a key that was never set, and
+  // the placeholder is what an operator should see as the suggested value.
+  const value = (key: string) => String(s[key] ?? "")
+  const patch = () => Object.fromEntries(ALERT_THRESHOLDS.map(({ key }) => [key, value(key)]))
+
+  return (
+    <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">Telegram 机器人</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            在 Telegram 里找 <code className="rounded bg-muted px-1">@BotFather</code> 建一个机器人，把整条 token 复制过来；
+            再对机器人说句话，然后用 <code className="rounded bg-muted px-1">@userinfobot</code> 查自己的 Chat ID。
+            群组要先把机器人拉进去，Chat ID 是负数。
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Bot Token" hint={s.alert_telegram_set ? "已设置，留空不变" : "未设置"}>
+            <Input
+              type="password"
+              placeholder={s.alert_telegram_set ? "••••••••" : "123456789:AA…"}
+              onChange={(e) => set("alert_telegram_token", e.target.value)}
+            />
+          </Field>
+          <Field label="Chat ID" hint="私聊是数字，群组是负数，公开频道可以填 @频道名">
+            <Input value={value("alert_telegram_chat")} onChange={(e) => set("alert_telegram_chat", e.target.value)} placeholder="-1001234567890" />
+          </Field>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            onClick={() => {
+              const body = patch()
+              // Only sent when typed. The hub never hands the token back, so an
+              // untouched field is empty and would otherwise clear it.
+              if (typeof s.alert_telegram_token === "string" && s.alert_telegram_token) {
+                body.alert_telegram_token = s.alert_telegram_token
+              }
+              body.alert_telegram_chat = value("alert_telegram_chat")
+              save(body)
+            }}
+          >
+            保存
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={testing}
+            onClick={async () => {
+              setTesting(true)
+              try {
+                await api("/alerts/test", { method: "POST" })
+                toast.success("已发送，去 Telegram 看一眼")
+              } catch (e) {
+                // Telegram's own refusal, verbatim: it is the only thing that
+                // says which of the two fields is wrong.
+                toast.error((e as Error).message)
+              } finally {
+                setTesting(false)
+              }
+            }}
+          >
+            <Send className="size-4" />
+            {testing ? "发送中…" : "发送测试消息"}
+          </Button>
+        </div>
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          测试用的是已保存的配置，不是上面输入框里的内容——先保存再测试。
+        </p>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">触发条件</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            每 30 秒检查一遍，只在状态变化时推送一次，不会每轮重复。填 0 表示关闭该条。
+            节点恢复、流量用尽（100%）、到期当天这些情况不受上面阈值影响，一定会播报。
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          {ALERT_THRESHOLDS.map(({ key, label, unit, placeholder }) => (
+            <Field key={key} label={label}>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={0}
+                  value={value(key)}
+                  onChange={(e) => set(key, e.target.value)}
+                  placeholder={placeholder}
+                />
+                <span className="shrink-0 text-sm text-muted-foreground">{unit}</span>
+              </div>
+            </Field>
+          ))}
+        </div>
+        <div>
+          <Button size="sm" onClick={() => save(patch())}>
+            保存触发条件
+          </Button>
+        </div>
+      </Card>
+    </div>
+  )
+}
+
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
   const [password, setPassword] = useState("")
@@ -1544,6 +1666,7 @@ const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
   { path: "/admin/data", label: "数据", icon: Database },
+  { path: "/admin/alerts", label: "告警", icon: BellRing },
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
   { path: "/admin/settings", label: "设置", icon: Settings },
@@ -1590,6 +1713,8 @@ export function Admin({
           <Ping nodes={nodes} />
         ) : path === "/admin/data" ? (
           <Data />
+        ) : path === "/admin/alerts" ? (
+          <Alerts />
         ) : path === "/admin/themes" ? (
           <Themes />
         ) : path === "/admin/security" ? (
