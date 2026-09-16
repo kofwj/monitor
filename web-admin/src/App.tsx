@@ -79,6 +79,17 @@ export default function App() {
     if (me?.authed && admin === false) loadMe()
   }, [admin, me?.authed, loadMe])
 
+  // The tab is the one place the site name cannot come from a render. The
+  // browser takes the title from the static index.html and only a script can
+  // change it afterwards, so without this the tab keeps saying "Monitor 后台"
+  // however the setting is renamed. The status page sets its own from the
+  // theme, which is why its tab follows the setting and this one did not.
+  // Falls back to the same word the static title uses, so an unset name is not
+  // a visible change.
+  useEffect(() => {
+    document.title = `${me?.site_name || "Monitor"} 后台`
+  }, [me?.site_name])
+
   // Only while there is nothing else to show. Login's onDone reloads /me, so a
   // transient failure in the second after signing in would otherwise replace the
   // entire signed-in panel with a full-page error while the node list streamed
@@ -146,6 +157,10 @@ export default function App() {
             // while the install command and OAuth callback need the real one.
             site={me.site || location.origin}
             canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
+            // /me carries the site name and the GitHub flag, both of which the
+            // settings pages edit and this component renders. Saving has to
+            // re-read it, or the header keeps the value from mount.
+            refreshMe={loadMe}
           />
         )}
       </main>

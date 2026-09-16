@@ -1159,8 +1159,12 @@ function Themes() {
 
 type Settings = Record<string, string | boolean>
 
-// Two pages write settings, and each loads only what it displays.
-function useSettings() {
+// Each settings page loads only what it displays, and writes through this hook.
+// `onSaved` re-reads `/api/me` after a write: the site name in the header and the
+// GitHub flag on the sign-in page are rendered from it, and neither comes back in
+// the PUT response, so without this the panel keeps what it had at mount until
+// the page is reloaded.
+function useSettings(onSaved?: () => void) {
   const [s, setS] = useState<Settings | null>(null)
   useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
   return {
@@ -1170,6 +1174,7 @@ function useSettings() {
       try {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
         toast.success("已保存")
+        onSaved?.()
       } catch (e) {
         toast.error((e as Error).message)
       }
@@ -1177,8 +1182,8 @@ function useSettings() {
   }
 }
 
-function SettingsTab() {
-  const { s, set, save } = useSettings()
+function SettingsTab({ refreshMe }: { refreshMe: () => void }) {
+  const { s, set, save } = useSettings(refreshMe)
   if (!s) return null
 
   return (
@@ -1306,8 +1311,8 @@ const ALERT_THRESHOLDS = [
   { key: "alert_resource_minutes", label: "且持续", unit: "分钟", placeholder: "5" },
 ] as const
 
-function Alerts() {
-  const { s, set, save } = useSettings()
+function Alerts({ refreshMe }: { refreshMe: () => void }) {
+  const { s, set, save } = useSettings(refreshMe)
   const [testing, setTesting] = useState(false)
   if (!s) return null
 
@@ -1416,8 +1421,8 @@ function Alerts() {
   )
 }
 
-function Security({ site }: { site: string }) {
-  const { s, set, save } = useSettings()
+function Security({ site, refreshMe }: { site: string; refreshMe: () => void }) {
+  const { s, set, save } = useSettings(refreshMe)
   const [password, setPassword] = useState("")
   if (!s) return null
   const callback = `${site}/api/auth/github/callback`
@@ -1679,6 +1684,7 @@ export function Admin({
   refresh,
   site,
   canProvision,
+  refreshMe,
 }: {
   path: string
   go: (to: string) => void
@@ -1686,6 +1692,7 @@ export function Admin({
   refresh: () => void
   site: string
   canProvision: boolean
+  refreshMe: () => void
 }) {
   return (
     <div className="flex flex-col gap-6 md:flex-row">
@@ -1714,13 +1721,13 @@ export function Admin({
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/alerts" ? (
-          <Alerts />
+          <Alerts refreshMe={refreshMe} />
         ) : path === "/admin/themes" ? (
           <Themes />
         ) : path === "/admin/security" ? (
-          <Security site={site} />
+          <Security site={site} refreshMe={refreshMe} />
         ) : path === "/admin/settings" ? (
-          <SettingsTab />
+          <SettingsTab refreshMe={refreshMe} />
         ) : (
           <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
         )}
