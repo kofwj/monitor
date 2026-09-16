@@ -797,6 +797,18 @@ fn truncate(text: &str, limit: usize) -> String {
 
 // ---- the panel ----
 
+/// What this hub calls itself in a message read away from the panel: the site
+/// name the operator set, falling back to the word `/api/me` uses.
+///
+/// Not the binary's name. One Telegram chat can hold the alerts of several hubs,
+/// and every one of them is "monitor-hub" -- the build's name, not the
+/// operator's -- so a message from this hub would be indistinguishable from the
+/// same message sent by any other. Whitespace counts as unset: the field is
+/// cleared by emptying it, and "  测试消息" reads worse than the fallback.
+fn hub_name(app: &App) -> String {
+    app.db.get("site_name").filter(|name| !name.trim().is_empty()).unwrap_or_else(|| "Monitor".into())
+}
+
 /// Sends one message with the stored configuration.
 ///
 /// The way to find out that a token is wrong is here, while an operator is looking
@@ -808,8 +820,8 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
     if !rules.addressed() {
         return (StatusCode::BAD_REQUEST, "先填写 Bot Token 和 Chat ID").into_response();
     }
-    let text = "monitor-hub 测试消息\n收到这条说明告警已经接通。";
-    match send(&app.http, TELEGRAM_API, &rules, text).await {
+    let text = format!("{} 测试消息\n收到这条说明告警已经接通。", hub_name(&app));
+    match send(&app.http, TELEGRAM_API, &rules, &text).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         // Telegram's refusal, not a generic one: it is the only thing that says
         // which of the two settings is wrong.
@@ -950,6 +962,19 @@ mod tests {
         assert!(!muted_ok("-3"));
         assert!(!muted_ok("1;2"));
         assert!(!muted_ok("1 2"));
+    }
+
+    /// The test message names the hub the operator is looking at, not the build.
+    /// Every hub answers to "monitor-hub", so a chat holding the alerts of
+    /// several of them could not tell which one spoke.
+    #[test]
+    fn a_hub_is_named_by_its_site_name_and_falls_back_when_it_is_unset() {
+        let app = App::for_test(Db::open(":memory:").unwrap());
+        assert_eq!(hub_name(&app), "Monitor", "the word /api/me falls back to");
+        app.db.set("site_name", "Status").unwrap();
+        assert_eq!(hub_name(&app), "Status");
+        app.db.set("site_name", "   ").unwrap();
+        assert_eq!(hub_name(&app), "Monitor", "cleared to whitespace is not a name");
     }
 
     /// The threshold is in minutes and `last_seen` advances once a minute, so a
