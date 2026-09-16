@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS alert_state (
   -- "nothing to report", which is where a node that has never alarmed starts.
   state   TEXT    NOT NULL,
   -- Unix seconds that state was entered, so "offline for 4m12s" is measured from
-  -- the transition rather than from the last report.
+  -- the transition rather than from the last report. A row that has just gone
+  -- quiet keeps the moment the state it left was entered instead, because the
+  -- recovery message is worded from it and may be retried half a minute later.
   since   INTEGER NOT NULL DEFAULT 0,
   -- Unix seconds of the last notification. `expiry` reads its local date to
   -- remind once a day; the rest use it only to recognise a repeat.
@@ -251,6 +253,13 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
 /// migrations are: the shape as of the version being reached, frozen once
 /// shipped. `SCHEMA` tracks whatever the current shape is, so a column added to
 /// this table later reaches an old file through a `migrate_to_5` instead.
+///
+/// Version 4 is contested. An unmerged upstream branch (`feat/notify`, PR #10)
+/// claims 4 as well, for a `migrate_to_4` that adds `node.notify` and
+/// `node.down_since` rather than this table. If it lands first, this migration
+/// moves whole: bump `SCHEMA_VERSION` to 5, rename this to `migrate_to_5`, and
+/// add the `from < 5` branch beside theirs. A file this build already stamped 4
+/// re-runs it harmlessly, because the table is created with `IF NOT EXISTS`.
 fn migrate_to_4(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS alert_state (

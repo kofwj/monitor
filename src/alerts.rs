@@ -528,10 +528,13 @@ fn record(
                 None => false,
             }
         };
-        // Kept across a repeat and across a retry: the duration in the message is
-        // the time in the state, not the time since the last attempt.
+        // Kept across a repeat, a retry and a clearing: the duration in the
+        // message is how long the state lasted, not how long ago the row was last
+        // written. A clearing in particular has to survive its own retry, or a
+        // recovery that failed to send would come back half a minute later saying
+        // "离线 30 秒" about an outage of ten minutes.
         let since = match stored {
-            Some(s) if !changed => s.since,
+            Some(s) if !changed || (send && finding.state.is_empty()) => s.since,
             _ => now,
         };
         app.db.set_alert_state(
@@ -565,8 +568,13 @@ fn told_before_today(stored: &AlertState, now: i64) -> bool {
 /// lasted. Only [`clears`] reaches here, so there is one kind to word.
 fn clear_line(finding: &Finding, stored: Option<&AlertState>, now: i64) -> String {
     match stored.map(|s| human(now.saturating_sub(s.since))) {
-        Some(away) => format!("{} 已恢复（离线 {away}）", finding.label),
-        None => format!("{} 已恢复", finding.label),
+        // The heading above already says "已恢复", so the line spends its words on
+        // the one thing the heading cannot say: how long the node was away.
+        Some(away) => format!("{} 离线 {away}", finding.label),
+        // Unreachable: a state is only cleared against the row that recorded it,
+        // and `record` drops a quiet finding that has no row. The name on its own
+        // is still a whole line under that heading rather than a broken one.
+        None => finding.label.clone(),
     }
 }
 
@@ -1098,12 +1106,38 @@ mod tests {
         let states = app.db.alert_states().unwrap();
         let back = record(&app, &states, vec![find("")], now + 600).unwrap();
         assert_eq!(back.len(), 1);
-        assert_eq!(back[0].line, "web 已恢复（离线 10 分钟）");
+        assert_eq!(back[0].line, "web 离线 10 分钟");
         app.db.alert_notified(id, "offline", now + 600).unwrap();
 
         // And the quiet that follows is not news either.
         let states = app.db.alert_states().unwrap();
         assert!(record(&app, &states, vec![find("")], now + 630).unwrap().is_empty());
+    }
+
+    /// A recovery message that did not get away is owed again, and the retry must
+    /// still name the length of the outage rather than the length of the retry.
+    #[test]
+    fn a_recovery_message_that_failed_to_send_still_names_the_whole_outage() {
+        let (app, id) = hub();
+        let now = 1_700_000_000;
+        let find = |state: &'static str| line(id, "offline", state);
+
+        // Down, and told.
+        record(&app, &none(), vec![find("offline")], now).unwrap();
+        app.db.alert_notified(id, "offline", now).unwrap();
+
+        // Back up ten minutes later. Telegram refuses the recovery, so `deliver`
+        // never reaches `alert_notified` and the row stays owed.
+        let states = app.db.alert_states().unwrap();
+        let back = record(&app, &states, vec![find("")], now + 600).unwrap();
+        assert_eq!(back[0].line, "web 离线 10 分钟");
+
+        // The retry half a minute later says the same thing. How long ago the
+        // message was first attempted is not how long the node was down.
+        let states = app.db.alert_states().unwrap();
+        let retry = record(&app, &states, vec![find("")], now + 630).unwrap();
+        assert_eq!(retry.len(), 1, "still owed");
+        assert_eq!(retry[0].line, "web 离线 10 分钟");
     }
 
     /// A quota coming back under its threshold is the operator's own doing, and
@@ -1202,7 +1236,7 @@ mod tests {
             Finding {
                 kind: "offline",
                 state: "",
-                line: "api 已恢复（离线 9 分钟）".into(),
+                line: "api 离线 9 分钟".into(),
                 ..Finding::quiet("offline")
             },
             Finding {
