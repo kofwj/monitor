@@ -968,6 +968,9 @@ const READABLE_SETTINGS: &[&str] = &[
     "alert_expiry_days",
     "alert_resource_percent",
     "alert_resource_minutes",
+    // Ids, not names: the alert page writes this from the node list it already
+    // has, and a node that is renamed keeps its mute.
+    "alert_muted_nodes",
 ];
 
 // ---- the database itself ----
@@ -1584,6 +1587,12 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "alert_resource_minutes" if !threshold(value, 0, 1_440) => {
             Some("持续时间是 0 到 1440 之间的分钟数，0 表示首次采样即告警".into())
+        }
+        // Checked rather than accepted blindly: the pass parses this on every
+        // tick and skips whatever does not parse, so a typo would mute a
+        // different set of nodes than the page shows, silently.
+        "alert_muted_nodes" if !crate::alerts::muted_ok(value) => {
+            Some("静音列表是逗号分隔的节点编号".into())
         }
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),

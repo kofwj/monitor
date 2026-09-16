@@ -896,6 +896,22 @@ impl Db {
         Ok(())
     }
 
+    /// Drops what one node remembers, for a node the operator has muted.
+    ///
+    /// The same reasoning as [`forget_alerts`], one node at a time: unmuting has
+    /// to announce the conditions that hold then, not the ones that held when the
+    /// node was muted. A node that was down for the whole muted period should say
+    /// so once, rather than stay silent because a row written before the mute
+    /// still agrees with it.
+    ///
+    /// Called every pass for every muted node. The statement is a no-op once the
+    /// rows are gone, and a muted node is one an operator asked to stop hearing
+    /// about, so the set is expected to be small.
+    pub fn forget_alerts_of(&self, node: i64) -> Result<()> {
+        self.conn().execute("DELETE FROM alert_state WHERE node_id = ?1", [node])?;
+        Ok(())
+    }
+
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
     /// A changed boot_id, or a counter that moved backwards, means the kernel

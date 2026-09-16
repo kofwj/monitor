@@ -1311,7 +1311,7 @@ const ALERT_THRESHOLDS = [
   { key: "alert_resource_minutes", label: "且持续", unit: "分钟", placeholder: "5" },
 ] as const
 
-function Alerts({ refreshMe }: { refreshMe: () => void }) {
+function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) {
   const { s, set, save } = useSettings(refreshMe)
   const [testing, setTesting] = useState(false)
   if (!s) return null
@@ -1320,6 +1320,20 @@ function Alerts({ refreshMe }: { refreshMe: () => void }) {
   // the placeholder is what an operator should see as the suggested value.
   const value = (key: string) => String(s[key] ?? "")
   const patch = () => Object.fromEntries(ALERT_THRESHOLDS.map(({ key }) => [key, value(key)]))
+
+  // Ids, not names: a node keeps its mute when it is renamed. Stored as the
+  // comma-separated list the hub validates, parsed back for the switches.
+  const muted = value("alert_muted_nodes").split(",").map((v) => v.trim()).filter(Boolean).map(Number)
+
+  // Written on the spot rather than behind a save button, because a switch that
+  // does not act until something else is pressed is one an operator leaves in the
+  // wrong position. The hub drops what the node remembered, so turning it back on
+  // reports whatever still holds instead of staying silent.
+  function toggle(id: number) {
+    const next = (muted.includes(id) ? muted.filter((v) => v !== id) : [...muted, id]).join(",")
+    set("alert_muted_nodes", next)
+    save({ alert_muted_nodes: next })
+  }
 
   return (
     <div className="space-y-4">
@@ -1416,6 +1430,41 @@ function Alerts({ refreshMe }: { refreshMe: () => void }) {
             保存触发条件
           </Button>
         </div>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">节点</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            关掉的节点不参与任何告警：离线、流量、到期、CPU / 内存 / 硬盘占用都不会推送。适合临时节点，
+            或者还在调试的机器。重新打开后，当前仍然成立的情况会立刻播报一次，不用等它再发生一遍。
+          </p>
+        </div>
+        {nodes.length === 0 ? (
+          <p className="text-sm text-muted-foreground">还没有节点。</p>
+        ) : (
+          <div className="space-y-2">
+            {nodes.map((node) => (
+              <div
+                key={node.id}
+                className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
+              >
+                <span className="flex min-w-0 items-center gap-2 text-sm">
+                  <span
+                    className={`size-2 shrink-0 rounded-full ${node.online ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
+                    title={node.online ? "在线" : "离线"}
+                  />
+                  <span className="truncate">{node.name}</span>
+                </span>
+                <Switch
+                  checked={!muted.includes(node.id)}
+                  onCheckedChange={() => toggle(node.id)}
+                  aria-label={`${node.name} 的告警`}
+                />
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
     </div>
   )
@@ -1721,7 +1770,7 @@ export function Admin({
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/alerts" ? (
-          <Alerts refreshMe={refreshMe} />
+          <Alerts refreshMe={refreshMe} nodes={nodes} />
         ) : path === "/admin/themes" ? (
           <Themes />
         ) : path === "/admin/security" ? (

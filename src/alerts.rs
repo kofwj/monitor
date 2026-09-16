@@ -16,7 +16,7 @@
 //! wording are plain functions over values: no clock, no socket, no hub. The loop
 //! at the bottom only gathers, records and sends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -59,7 +59,7 @@ const TELEGRAM_API: &str = "https://api.telegram.org";
 /// either way they can disagree is silent -- a field that can be typed into and
 /// never saved, or one that reloads blank however many times it is saved.
 #[cfg(test)]
-pub const SETTINGS: [&str; 7] = [
+pub const SETTINGS: [&str; 8] = [
     "alert_telegram_token",
     "alert_telegram_chat",
     "alert_offline_minutes",
@@ -67,6 +67,7 @@ pub const SETTINGS: [&str; 7] = [
     "alert_expiry_days",
     "alert_resource_percent",
     "alert_resource_minutes",
+    "alert_muted_nodes",
 ];
 
 // ---- what the panel may write ----
@@ -93,6 +94,18 @@ pub fn chat_ok(value: &str) -> bool {
     }
 }
 
+/// The nodes to stay quiet about, as the panel writes them: comma-separated ids,
+/// empty meaning none.
+///
+/// Checked because the value is parsed on every pass by [`Rules::read`], where a
+/// part that does not parse is skipped in silence -- so a typo would mute a
+/// different set of nodes than the panel shows, and nothing would say so. Ids are
+/// what is stored rather than names: a node can be renamed, and a mute that
+/// followed the name would move to whichever node took it.
+pub fn muted_ok(value: &str) -> bool {
+    value.is_empty() || value.split(',').all(|part| part.trim().parse::<i64>().is_ok_and(|id| id > 0))
+}
+
 // ---- the rules ----
 
 /// The rules as the last pass read them.
@@ -105,6 +118,11 @@ pub struct Rules {
     expiry_days: i64,
     resource_percent: i64,
     resource_minutes: i64,
+    /// Nodes the operator asked not to hear about. A node here is not judged at
+    /// all, which is a different thing from a rule being switched off: the rule
+    /// still applies to every other node, and this one is excluded from all of
+    /// them at once.
+    muted: HashSet<i64>,
 }
 
 impl Rules {
@@ -118,6 +136,16 @@ impl Rules {
             expiry_days: number("alert_expiry_days"),
             resource_percent: number("alert_resource_percent"),
             resource_minutes: number("alert_resource_minutes"),
+            // A part that does not parse is skipped rather than failing the pass;
+            // `muted_ok` is what keeps such a value from being stored. See there
+            // for why the two are separate.
+            muted: app
+                .db
+                .get("alert_muted_nodes")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect(),
         }
     }
 
@@ -457,6 +485,12 @@ async fn once(app: &App, api: &str, rules: &Rules, uptime: Duration) -> Result<(
             app.db.forget_alerts(Some(kind))?;
         }
     }
+    // And the same for a muted node, for the same reason applied to one node: it
+    // is excluded from every rule at once, so unmuting it has to report what holds
+    // then rather than what held when it went quiet.
+    for id in &rules.muted {
+        app.db.forget_alerts_of(*id)?;
+    }
 
     let pass = Pass {
         rules,
@@ -468,14 +502,17 @@ async fn once(app: &App, api: &str, rules: &Rules, uptime: Duration) -> Result<(
 
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
-    // Every node, every rule, one pass over the map of connected agents. Held only
-    // for the gather: the writes below and the request after them belong to no
-    // lock.
+    // Every node, every rule, one pass over the map of connected agents. A muted
+    // node is dropped here rather than left to `judge`, because "not judged" and
+    // "judged and found quiet" are not the same thing: the second still writes the
+    // row that would suppress the message after unmuting. Held only for the
+    // gather: the writes below and the request after them belong to no lock.
     let findings = {
         let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
         let none = Traffic::default();
         nodes
             .iter()
+            .filter(|node| !rules.muted.contains(&node.id))
             .flat_map(|node| pass.judge(node, agents.get(&node.id), traffic.get(&node.id).unwrap_or(&none)))
             .collect()
     };
@@ -800,6 +837,7 @@ mod tests {
             expiry_days: 7,
             resource_percent: 90,
             resource_minutes: 5,
+            muted: HashSet::new(),
         }
     }
 
@@ -895,6 +933,23 @@ mod tests {
         assert!(!chat_ok("@"));
         assert!(!chat_ok("monitor_alerts"));
         assert!(!chat_ok("12 34"));
+    }
+
+    /// Ids and nothing else. The pass parses this list every tick and skips what
+    /// does not parse, so a value that got through here would mute a different set
+    /// of nodes than the page shows, and nothing would say so.
+    #[test]
+    fn a_mute_list_is_ids_and_only_ids() {
+        assert!(muted_ok(""), "empty is the default: nobody muted");
+        assert!(muted_ok("1"));
+        assert!(muted_ok("1,2,3"));
+        assert!(muted_ok(" 1 , 2 "), "the spacing the panel writes");
+        assert!(!muted_ok("web"), "a name is not an id, and one can be renamed");
+        assert!(!muted_ok("1,,2"), "an empty part is not a node");
+        assert!(!muted_ok("0"), "ids start at one");
+        assert!(!muted_ok("-3"));
+        assert!(!muted_ok("1;2"));
+        assert!(!muted_ok("1 2"));
     }
 
     /// The threshold is in minutes and `last_seen` advances once a minute, so a
@@ -1408,6 +1463,53 @@ mod tests {
         // Told once. The node is still down and the operator already knows.
         once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1, "an unchanged condition is not repeated");
+    }
+
+    /// A muted node is not judged at all -- which is not the same as judged and
+    /// found quiet. The quiet verdict still writes the row, and that row is what
+    /// would suppress the first message after the mute is lifted.
+    #[tokio::test]
+    async fn a_muted_node_says_nothing_and_unmuting_it_reports_what_holds_then() {
+        let (api, seen) = mock_telegram(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (app, id) = wired();
+
+        // Ten minutes quiet is a message on the first pass; muted, it is not.
+        app.db.set("alert_muted_nodes", &id.to_string()).unwrap();
+        let rules = Rules::read(&app);
+        assert!(rules.muted.contains(&id), "the id in the setting is the node that is muted");
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "a muted node says nothing");
+        assert!(app.db.alert_states().unwrap().is_empty(), "and nothing is recorded about it");
+
+        // Still down, now unmuted. The operator hears about the outage they muted
+        // through rather than never, which is what a row written before the mute
+        // would have bought them.
+        app.db.set("alert_muted_nodes", "").unwrap();
+        let rules = Rules::read(&app);
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 1, "unmuting reports the condition that holds");
+        assert_eq!(sent[0]["text"].as_str().unwrap(), "<b>离线</b>\nweb 已离线 10 分钟\n");
+    }
+
+    /// Muting is per node, not a switch for the feature: the same pass still
+    /// announces every other node.
+    #[tokio::test]
+    async fn muting_one_node_leaves_the_others_alone() {
+        let (api, seen) = mock_telegram(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (app, first) = wired();
+        let second = app.db.create_node(&node("db"), "second-token").unwrap();
+        app.db.touch_seen(second, Utc::now().timestamp() - 600).unwrap();
+
+        app.db.set("alert_muted_nodes", &first.to_string()).unwrap();
+        let rules = Rules::read(&app);
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the node that is not muted still gets through");
+        let text = sent[0]["text"].as_str().unwrap();
+        assert!(text.contains("db 已离线"), "{text}");
+        assert!(!text.contains("web"), "{text}");
     }
 
     /// A refusal from Telegram leaves the alert owed rather than dropped, and
