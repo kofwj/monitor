@@ -16,7 +16,11 @@ read -r TAG SHA <web-theme.pin || true
 [ -n "${TAG:-}" ] && [ -n "${SHA:-}" ] ||
   { echo "web-theme.pin must hold '<tag> <sha256>'" >&2; exit 1; }
 DEST=target/theme
-URL="https://github.com/monitor-probe/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
+# The fork, not upstream: this theme is the one this fork releases, and it is not
+# the same artifact -- it carries a footer naming this fork's repository. The pin
+# names a tag that only exists here, so leaving the upstream URL in place would
+# 404 the moment the pin moves.
+URL="https://github.com/kofwj/monitor-theme-default/releases/download/$TAG/theme.tar.gz"
 
 # Already unpacked at this pin. A theme placed here manually with a matching
 # stamp is also left alone, which is how an unreleased theme is built against.

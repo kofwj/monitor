@@ -589,6 +589,11 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "authed": authed(&app, &headers),
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
+        // The version this binary was built from, for the two footers that say so:
+        // the panel's, which is embedded in this same binary, and the status page's,
+        // which is a theme the hub cannot reach into. Compiled in rather than read
+        // from a file, so it cannot disagree with the code answering this.
+        "version": env!("CARGO_PKG_VERSION"),
         "public_page": app.public_page(),
         "can_provision": provisioning_allowed(&app, &headers),
         // The hub's own public URL when one was given, which is what belongs in an

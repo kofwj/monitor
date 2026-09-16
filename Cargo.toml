@@ -1,6 +1,12 @@
 [package]
 name = "monitor-hub"
-version = "1.0.0"
+# Bumped by hand when a release is cut, and it is the only source of the version
+# the hub reports: `/api/me` hands it to the panel and the status page, and
+# `--help` prints it. `release.yml` builds from whatever is on the ref and knows
+# nothing about this number, so a release that forgets to bump it ships a binary
+# naming the previous one -- which is how this sat at 1.0.0 through v1.0.1 and
+# v1.0.2.
+version = "1.0.4"
 edition = "2021"
 license = "MIT"
 description = "Lightweight server monitoring hub"

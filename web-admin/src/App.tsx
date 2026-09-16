@@ -8,7 +8,12 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisioningSite, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
+// The fork this binary is built from, rather than the upstream project: the
+// footer exists so somebody looking at a running hub can find the code that is
+// actually running, and on this deployment that is not upstream.
+const REPO = "https://github.com/kofwj/monitor"
+
+type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean; version?: string }
 
 // `/admin` alone is not a page; it is normalised to the first section so that a
 // bookmark and the OAuth redirect both resolve to a real route.
@@ -164,6 +169,26 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* What is running, and where it came from. The version is the hub's, not
+          this bundle's: the panel has no version of its own, and the two ship in
+          the same binary. A hub older than the field sends none, so the line is
+          assembled from what arrived rather than leaving a separator with nothing
+          on one side of it. */}
+      <footer className="mx-auto max-w-7xl px-4 pb-10 pt-2">
+        <p className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+          {me.version && <span className="tnum">v{me.version}</span>}
+          {me.version && <span aria-hidden="true">·</span>}
+          <a
+            href={REPO}
+            target="_blank"
+            rel="noreferrer"
+            className="underline-offset-4 hover:text-foreground hover:underline"
+          >
+            github.com/kofwj/monitor
+          </a>
+        </p>
+      </footer>
 
       <Toaster position="top-center" theme={dark ? "dark" : "light"} />
     </div>
