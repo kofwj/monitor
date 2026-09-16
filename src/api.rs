@@ -963,6 +963,8 @@ const READABLE_SETTINGS: &[&str] = &[
     // The alert thresholds, from the module that reads them: a key listed there
     // and not here is one the alert page could never load.
     "alert_telegram_chat",
+    "alert_webhook_url",
+    "alert_webhook_headers",
     "alert_offline_minutes",
     "alert_traffic_percent",
     "alert_expiry_days",
@@ -1569,6 +1571,23 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // in the hub's own log, which is the same failure with a worse message.
         "alert_telegram_chat" if !(value.is_empty() || crate::alerts::chat_ok(value)) => {
             Some("Chat ID 是数字（群组为负数）或 @频道名".into())
+        }
+        // The hub posts to this on every pass, and a typo fails as a request error
+        // in its journal that does not name the setting -- which reads exactly like
+        // an endpoint that is down, a thing an operator may be living with on
+        // purpose and therefore will not go looking for.
+        //
+        // http:// is accepted here where `github_proxy` insists on https://. What
+        // travels this URL is a sentence about which of the operator's nodes went
+        // down; what travels that one is a binary their nodes will execute.
+        "alert_webhook_url" if !(value.is_empty() || crate::alerts::webhook_ok(value)) => {
+            Some("Webhook 地址要以 http:// 或 https:// 开头，并带上主机名".into())
+        }
+        // Checked rather than accepted blindly, for the same reason as the URL: the
+        // headers are rebuilt on every pass, where a line with no colon is dropped
+        // in silence -- and the receiver's 401 is the only sign that one went.
+        "alert_webhook_headers" if !crate::alerts::headers_ok(value) => {
+            Some("请求头每行一条，形如 Name: value".into())
         }
         // Every threshold is a whole number of minutes, percent or days, and zero
         // is off -- the same way a node with a traffic limit of zero has no limit.

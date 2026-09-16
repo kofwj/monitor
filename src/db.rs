@@ -254,12 +254,18 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
 /// shipped. `SCHEMA` tracks whatever the current shape is, so a column added to
 /// this table later reaches an old file through a `migrate_to_5` instead.
 ///
-/// Version 4 is contested. An unmerged upstream branch (`feat/notify`, PR #10)
+/// Version 4 is contested. Upstream's `feat/notify` (PR #10, merged 2026-09-16)
 /// claims 4 as well, for a `migrate_to_4` that adds `node.notify` and
-/// `node.down_since` rather than this table. If it lands first, this migration
-/// moves whole: bump `SCHEMA_VERSION` to 5, rename this to `migrate_to_5`, and
-/// add the `from < 5` branch beside theirs. A file this build already stamped 4
-/// re-runs it harmlessly, because the table is created with `IF NOT EXISTS`.
+/// `node.down_since` rather than this table. The two have not met yet: this fork
+/// has not merged upstream since, so nothing here has moved. When they do meet,
+/// this migration moves whole -- bump `SCHEMA_VERSION` to 5, rename this to
+/// `migrate_to_5`, and add the `from < 5` branch beside theirs, leaving upstream's
+/// at 4. A file this build already stamped 4 re-runs it harmlessly, because the
+/// table is created with `IF NOT EXISTS`.
+///
+/// The failure mode is why this is written here rather than left to a note
+/// somewhere: a version number that does not line up leaves the table missing and
+/// says nothing in the log.
 fn migrate_to_4(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS alert_state (

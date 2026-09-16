@@ -1,8 +1,9 @@
-//! Telegram alerts.
+//! Telegram and webhook alerts.
 //!
 //! One pass every [`TICK`] reads every node and every rule, compares what it finds
 //! against what the previous pass recorded in `alert_state`, and sends one message
-//! for whatever changed.
+//! for whatever changed. A hub with both channels configured posts to both; the
+//! message is the same one, rendered per channel by [`compose`].
 //!
 //! What changed, rather than what is. A rule that is over its threshold is over it
 //! on every pass, and a hub that announced that would send the same message every
@@ -46,10 +47,15 @@ const TICK: Duration = Duration::from_secs(30);
 /// cheaper than one that is refused.
 const BUDGET: usize = 3_800;
 
-/// Where the Bot API lives. A parameter of [`send`] rather than spliced into the
-/// format string there, so a test can point the transport at a local server while
-/// [`endpoint`] still proves the address this build actually uses.
+/// Where the Bot API lives. A parameter of [`send_telegram`] rather than spliced
+/// into the format string there, so a test can point the transport at a local
+/// server while [`endpoint`] still proves the address this build actually uses.
 const TELEGRAM_API: &str = "https://api.telegram.org";
+
+/// What a heading is wrapped in, per channel. Telegram's HTML parse mode reads
+/// `<b>` as bold; a webhook's reader is a script, which would show the tags.
+const HTML: (&str, &str) = ("<b>", "</b>");
+const PLAIN: (&str, &str) = ("", "");
 
 /// Every key the alert page writes, in the order the panel shows them.
 ///
@@ -59,9 +65,11 @@ const TELEGRAM_API: &str = "https://api.telegram.org";
 /// either way they can disagree is silent -- a field that can be typed into and
 /// never saved, or one that reloads blank however many times it is saved.
 #[cfg(test)]
-pub const SETTINGS: [&str; 8] = [
+pub const SETTINGS: [&str; 10] = [
     "alert_telegram_token",
     "alert_telegram_chat",
+    "alert_webhook_url",
+    "alert_webhook_headers",
     "alert_offline_minutes",
     "alert_traffic_percent",
     "alert_expiry_days",
@@ -94,6 +102,48 @@ pub fn chat_ok(value: &str) -> bool {
     }
 }
 
+/// A webhook address: a scheme the hub can speak, and a host after it.
+///
+/// Checked because this URL is posted to on every pass, and a typo fails as a
+/// request error in the hub's journal that does not name the setting -- which is
+/// the same failure as an endpoint that is down, a thing an operator may be
+/// living with on purpose.
+///
+/// `http://` is allowed where `github_proxy` insists on `https://`. What travels
+/// this URL is a sentence about which of the operator's nodes went down, not a
+/// binary another machine will execute; the same reason the bot token is worth
+/// more than the message it sends.
+pub fn webhook_ok(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://").or_else(|| value.strip_prefix("http://")) else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !host.is_empty() && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// The punctuation RFC 9110 allows in a header field name, minus the space.
+const HEADER_PUNCT: &str = "!#$%&'*+-.^_`|~";
+
+/// Extra request headers, one `Name: value` per line, empty meaning none.
+///
+/// The shape every self-hosted endpoint already documents, and the one a `curl`
+/// example in its README is written in, rather than a field per header: the hub
+/// cannot know whether the operator needs `Authorization`, `X-Gotify-Key`, or
+/// nothing at all.
+///
+/// Checked because the headers are rebuilt on every pass, so a line with no colon
+/// would be dropped there in silence -- an endpoint answering 401 to a request
+/// that looks, from the panel, fully configured.
+pub fn headers_ok(value: &str) -> bool {
+    value.lines().filter(|line| !line.trim().is_empty()).all(|line| match line.split_once(':') {
+        Some((name, _)) => {
+            let name = name.trim();
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || HEADER_PUNCT.contains(c))
+        }
+        None => false,
+    })
+}
+
 /// The nodes to stay quiet about, as the panel writes them: comma-separated ids,
 /// empty meaning none.
 ///
@@ -113,6 +163,13 @@ pub fn muted_ok(value: &str) -> bool {
 pub struct Rules {
     token: String,
     chat: String,
+    /// Where a webhook is posted, empty when none is configured. One address
+    /// rather than a list: the second endpoint an operator wants is a thing they
+    /// already have, and it can forward.
+    webhook: String,
+    /// The webhook's extra headers, as the panel wrote them. Parsed where they
+    /// are used; see [`send_webhook`].
+    headers: String,
     offline_minutes: i64,
     traffic_percent: i64,
     expiry_days: i64,
@@ -131,6 +188,8 @@ impl Rules {
         Self {
             token: app.db.get("alert_telegram_token").unwrap_or_default().trim().to_owned(),
             chat: app.db.get("alert_telegram_chat").unwrap_or_default().trim().to_owned(),
+            webhook: app.db.get("alert_webhook_url").unwrap_or_default().trim().to_owned(),
+            headers: app.db.get("alert_webhook_headers").unwrap_or_default().trim().to_owned(),
             offline_minutes: number("alert_offline_minutes"),
             traffic_percent: number("alert_traffic_percent"),
             expiry_days: number("alert_expiry_days"),
@@ -149,12 +208,31 @@ impl Rules {
         }
     }
 
-    /// Whether there is anywhere to send to. A rule switched on without one is
-    /// not evaluated: there is no point recording what an operator was told when
-    /// there is no way to tell them, and the first pass after a bot is configured
-    /// should announce what is true then.
-    fn addressed(&self) -> bool {
+    /// Whether the Telegram channel has somewhere to send to. A bot without a
+    /// chat is not configured, the same way a chat without a bot is not.
+    fn telegram(&self) -> bool {
         !self.token.is_empty() && !self.chat.is_empty()
+    }
+
+    /// The channels this hub is configured to send on, in the order they are
+    /// tried. Both is a normal answer: the message is the same one, and an
+    /// operator may want it in a chat and in whatever they run at home.
+    fn channels(&self) -> Vec<Channel> {
+        [Channel::Telegram, Channel::Webhook]
+            .into_iter()
+            .filter(|channel| match channel {
+                Channel::Telegram => self.telegram(),
+                Channel::Webhook => !self.webhook.is_empty(),
+            })
+            .collect()
+    }
+
+    /// Whether there is anywhere to send to at all. A rule switched on without a
+    /// channel is not evaluated: there is no point recording what an operator was
+    /// told when there is no way to tell them, and the first pass after a channel
+    /// is configured should announce what is true then.
+    fn addressed(&self) -> bool {
+        !self.channels().is_empty()
     }
 
     /// Which rules are switched on. A threshold of zero is off, the same way a
@@ -617,19 +695,69 @@ fn clear_line(finding: &Finding, stored: Option<&AlertState>, now: i64) -> Strin
 
 /// Sends what is owed, then marks it told.
 ///
-/// The order is the point: a message that failed to send leaves its row owed, so
-/// the next pass sends it again rather than the alert being lost to one
-/// unreachable minute. A pass that produced several messages and failed on a later
-/// one repeats the earlier ones; that is the price of not being able to tell a
-/// delivered message from a lost one, and it is cheaper than silence.
+/// Where an alert can go. A hub with both configured posts to both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Telegram,
+    Webhook,
+}
+
+impl Channel {
+    /// What this channel is called where a failure is reported: the hub's log,
+    /// and the panel when it is the test message that failed.
+    fn name(self) -> &'static str {
+        match self {
+            Channel::Telegram => "Telegram",
+            Channel::Webhook => "Webhook",
+        }
+    }
+}
+
+/// Sends what a pass owes, over every channel that is configured.
+///
+/// A channel that refuses the message is logged and the pass carries on: an alert
+/// that reached the operator by one route has been delivered, and retrying in
+/// order to satisfy a second route that is misconfigured would repeat the first
+/// one every thirty seconds until somebody noticed -- turning one outage into a
+/// flood is a worse failure than the second channel missing it, and the log names
+/// the channel that failed, which is what an operator needs to fix it.
+///
+/// Only a message no channel took is left owed, so it is tried again rather than
+/// lost to one unreachable minute. A pass that produced several messages and
+/// failed on a later one repeats the earlier ones; that is the price of not being
+/// able to tell a delivered message from a lost one, and it is cheaper than
+/// silence.
 async fn deliver(app: &App, api: &str, rules: &Rules, owed: &[Finding]) -> Result<()> {
+    let hub = hub_name(app);
+    let channels = rules.channels();
     for message in render(owed) {
-        send(&app.http, api, rules, &message).await?;
+        let mut delivered = false;
+        let mut failures = Vec::new();
+        for channel in &channels {
+            let sent = match channel {
+                Channel::Telegram => send_telegram(&app.http, api, rules, &compose(&message, HTML)).await,
+                Channel::Webhook => {
+                    let text = compose(&message, PLAIN);
+                    send_webhook(&app.http, rules, &hub, &text, &message).await
+                }
+            };
+            match sent {
+                Ok(()) => delivered = true,
+                Err(e) => failures.push(format!("{}: {e:#}", channel.name())),
+            }
+        }
+        if !delivered {
+            anyhow::bail!("no channel took the message: {}", failures.join("; "));
+        }
+        for failure in failures {
+            warn!("a channel did not take the alert -- {failure}");
+        }
     }
     for finding in owed {
         app.db.alert_notified(finding.node, finding.kind, Utc::now().timestamp())?;
     }
-    info!("sent {} alert line(s) to the configured chat", owed.len());
+    let names: Vec<&str> = channels.iter().map(|channel| channel.name()).collect();
+    info!("sent {} alert line(s) on {}", owed.len(), names.join(", "));
     Ok(())
 }
 
@@ -638,12 +766,12 @@ fn endpoint(api: &str, token: &str) -> String {
     format!("{api}/bot{token}/sendMessage")
 }
 
-/// Posts one message.
+/// Posts one message to the configured chat.
 ///
 /// The error from a failed request is rebuilt without its URL, because the URL
 /// carries the bot token and this error is logged: a hub whose DNS was briefly
 /// unreachable would otherwise write its own credential into its journal.
-async fn send(client: &reqwest::Client, api: &str, rules: &Rules, text: &str) -> Result<()> {
+async fn send_telegram(client: &reqwest::Client, api: &str, rules: &Rules, text: &str) -> Result<()> {
     let body = json!({
         "chat_id": rules.chat,
         "text": text,
@@ -668,6 +796,62 @@ async fn send(client: &reqwest::Client, api: &str, rules: &Rules, text: &str) ->
     Ok(())
 }
 
+/// Posts one message to the configured webhook.
+///
+/// The headers are parsed here rather than held parsed, because the setting is
+/// the operator's own text and this is the only place a bad line can be named.
+/// The panel refuses to store one that is not `Name: value`, so what is left to
+/// fail is a name or a value the HTTP layer will not carry -- the same mistake
+/// with the same remedy, and an error naming it either way.
+///
+/// The error is rebuilt without its URL for the same reason as Telegram's, and
+/// with less of an excuse: `?token=` is how half of the webhook endpoints there
+/// are authenticate, so the credential here is in the URL as often as not.
+async fn send_webhook(
+    client: &reqwest::Client,
+    rules: &Rules,
+    hub: &str,
+    text: &str,
+    lines: &[Line<'_>],
+) -> Result<()> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for line in rules.headers.lines().filter(|line| !line.trim().is_empty()) {
+        let (name, value) =
+            line.split_once(':').ok_or_else(|| anyhow!("webhook header {line:?} is not Name: value"))?;
+        let name = reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|e| anyhow!("webhook header name {:?} is not one: {e}", name.trim()))?;
+        let value = reqwest::header::HeaderValue::from_str(value.trim())
+            .map_err(|e| anyhow!("webhook header {name} carries a value HTTP will not: {e}"))?;
+        headers.insert(name, value);
+    }
+    let response = client
+        .post(&rules.webhook)
+        .headers(headers)
+        .json(&webhook_body(hub, text, lines))
+        .send()
+        .await
+        .map_err(|e| anyhow!("the webhook request failed: {}", e.without_url()))?;
+    let status = response.status();
+    if !status.is_success() {
+        // Whatever the receiver said. A script's own 401 or its own exception text
+        // is the only thing that distinguishes a wrong header from an endpoint
+        // that is simply not there.
+        let detail = response.text().await.unwrap_or_default();
+        anyhow::bail!("the webhook refused the message ({status}): {}", truncate(&detail, 300));
+    }
+    Ok(())
+}
+
+/// One line of a message: the heading it belongs under, and the line itself.
+type Line<'a> = (&'static str, &'a str);
+
+/// One message's worth of the pass, in the order it is written.
+///
+/// The heading repeats on each of its lines rather than opening a group, so that a
+/// formatter decides where to print it -- see [`compose`] -- and neither the split
+/// in [`render`] nor the JSON in [`webhook_body`] needs a second structure to walk.
+type Message<'a> = Vec<Line<'a>>;
+
 /// The pass as one message, or as several when it has more to say than Telegram
 /// will take.
 ///
@@ -676,7 +860,7 @@ async fn send(client: &reqwest::Client, api: &str, rules: &Rules, text: &str) ->
 /// A group that outgrows one message continues into the next under a repeated
 /// heading rather than being sent oversized, which Telegram would refuse and the
 /// hub would then retry forever.
-fn render(owed: &[Finding]) -> Vec<String> {
+fn render(owed: &[Finding]) -> Vec<Message<'_>> {
     let mut ordered: Vec<(u8, &'static str, &str)> = owed
         .iter()
         .map(|f| {
@@ -687,31 +871,80 @@ fn render(owed: &[Finding]) -> Vec<String> {
     // Stable, so nodes keep the order the database gave them within a group.
     ordered.sort_by_key(|(rank, _, _)| *rank);
 
-    let mut messages: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut open = "";
+    let mut messages: Vec<Message<'_>> = Vec::new();
+    let mut current: Message<'_> = Vec::new();
+    let mut weight = 0;
     for (_, heading, line) in ordered {
-        let extra = if heading == open { 0 } else { heading.len() + 10 };
-        if !current.is_empty() && current.len() + line.len() + extra > BUDGET {
+        // What the line costs the message it is about to join: itself and its
+        // newline, plus -- where its heading is not already open there -- the
+        // heading, its tags, and the blank line that separates it from the group
+        // above. A message with nothing in it has no heading open, so the line that
+        // begins one pays for a heading too.
+        let opens = match current.last() {
+            None => true,
+            Some((open, _)) => *open != heading,
+        };
+        let mut added = line.len()
+            + 1
+            + if opens { heading.len() + 8 + if current.is_empty() { 0 } else { 1 } } else { 0 };
+        if !current.is_empty() && weight + added > BUDGET {
             messages.push(std::mem::take(&mut current));
-            open = "";
+            weight = 0;
+            // The line now opens a message of its own, which means it pays for the
+            // heading it was going to inherit.
+            added = line.len() + 1 + heading.len() + 8;
         }
-        if heading != open {
-            if !current.is_empty() {
-                current.push('\n');
-            }
-            current.push_str("<b>");
-            current.push_str(heading);
-            current.push_str("</b>\n");
-            open = heading;
-        }
-        current.push_str(line);
-        current.push('\n');
+        weight += added;
+        current.push((heading, line));
     }
     if !current.is_empty() {
         messages.push(current);
     }
     messages
+}
+
+/// A message written out for one channel: each line under its heading, the heading
+/// printed again only where it changes.
+///
+/// `tag` is what a heading is wrapped in. Telegram's HTML parse mode needs the
+/// `<b>`; a webhook's reader is a script, and would show the tags as text.
+fn compose(message: &Message<'_>, tag: (&str, &str)) -> String {
+    let (open_tag, close_tag) = tag;
+    let mut out = String::new();
+    let mut open = "";
+    for (heading, line) in message {
+        if *heading != open {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(open_tag);
+            out.push_str(heading);
+            out.push_str(close_tag);
+            out.push('\n');
+            open = heading;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// What a webhook receives.
+///
+/// `text` is the message as [`compose`] writes it, so a receiver that only wants
+/// to show somebody what happened can post that one field and ignore the rest.
+/// `lines` is the same message taken apart, because the alternative for a script
+/// is splitting `text` on newlines and guessing which half is a node's name and
+/// which is the wording -- the coupling this format exists to avoid.
+fn webhook_body(hub: &str, text: &str, lines: &[Line<'_>]) -> Value {
+    json!({
+        "hub": hub,
+        "text": text,
+        "lines": lines
+            .iter()
+            .map(|(heading, line)| json!({"heading": heading, "text": line}))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// A group's heading, and where it sits in the message. Offline first: it is the
@@ -809,23 +1042,42 @@ fn hub_name(app: &App) -> String {
     app.db.get("site_name").filter(|name| !name.trim().is_empty()).unwrap_or_else(|| "Monitor".into())
 }
 
-/// Sends one message with the stored configuration.
+/// Sends one message with the stored configuration, over every configured
+/// channel.
 ///
-/// The way to find out that a token is wrong is here, while an operator is looking
-/// at the page, rather than the first time a node goes down. Deliberately not a
-/// GET: it puts a message in a chat, and a GET is something a browser, a link
-/// preview or a proxy may issue on its own.
+/// The way to find out that a token or an address is wrong is here, while an
+/// operator is looking at the page, rather than the first time a node goes down.
+/// Deliberately not a GET: it puts a message in a chat and a request at a URL, and
+/// a GET is something a browser, a link preview or a proxy may issue on its own.
+///
+/// One channel failing does not stop the other from being tried, and the answer
+/// names which one failed: an operator who has just added a webhook needs to know
+/// that the webhook is the broken half, not that "the test failed".
 pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
     let rules = Rules::read(&app);
     if !rules.addressed() {
-        return (StatusCode::BAD_REQUEST, "先填写 Bot Token 和 Chat ID").into_response();
+        return (StatusCode::BAD_REQUEST, "先填写 Bot Token 和 Chat ID，或 Webhook 地址").into_response();
     }
-    let text = format!("{} 测试消息\n收到这条说明告警已经接通。", hub_name(&app));
-    match send(&app.http, TELEGRAM_API, &rules, &text).await {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        // Telegram's refusal, not a generic one: it is the only thing that says
-        // which of the two settings is wrong.
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    let hub = hub_name(&app);
+    let text = format!("{hub} 测试消息\n收到这条说明告警已经接通。");
+    let mut failures = Vec::new();
+    for channel in rules.channels() {
+        let sent = match channel {
+            Channel::Telegram => send_telegram(&app.http, TELEGRAM_API, &rules, &text).await,
+            // No lines: a test message describes nothing. It is here to prove the
+            // address and the headers, and a receiver that reads `lines` will find
+            // it empty on this one call and populated on every real one.
+            Channel::Webhook => send_webhook(&app.http, &rules, &hub, &text, &[]).await,
+        };
+        if let Err(e) = sent {
+            failures.push(format!("{}：{e:#}", channel.name()));
+        }
+    }
+    match failures.is_empty() {
+        true => Json(json!({"ok": true})).into_response(),
+        // The channel's own refusal, not a generic one: it is the only thing that
+        // says which of the fields is wrong.
+        false => (StatusCode::BAD_GATEWAY, failures.join("\n")).into_response(),
     }
 }
 
@@ -844,6 +1096,8 @@ mod tests {
         Rules {
             token: "1:abcdefghijklmnopqrstuvwxyz0123456789".into(),
             chat: "-100123".into(),
+            webhook: String::new(),
+            headers: String::new(),
             offline_minutes: 5,
             traffic_percent: 80,
             expiry_days: 7,
@@ -897,6 +1151,8 @@ mod tests {
         let stored = [
             ("alert_telegram_token", "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"),
             ("alert_telegram_chat", "-1001234567890"),
+            ("alert_webhook_url", "https://example.com/hook"),
+            ("alert_webhook_headers", "Authorization: Bearer abc"),
             ("alert_offline_minutes", "11"),
             ("alert_traffic_percent", "22"),
             ("alert_expiry_days", "33"),
@@ -911,6 +1167,8 @@ mod tests {
         let rules = Rules::read(&app);
         assert_eq!(rules.token, stored[0].1);
         assert_eq!(rules.chat, stored[1].1);
+        assert_eq!(rules.webhook, stored[2].1);
+        assert_eq!(rules.headers, stored[3].1);
         assert_eq!(rules.offline_minutes, 11);
         assert_eq!(rules.traffic_percent, 22);
         assert_eq!(rules.expiry_days, 33);
@@ -945,6 +1203,47 @@ mod tests {
         assert!(!chat_ok("@"));
         assert!(!chat_ok("monitor_alerts"));
         assert!(!chat_ok("12 34"));
+    }
+
+    /// A webhook address has to be one this hub can post to. `http://` is allowed
+    /// here where the agent mirror insists on `https://`: what travels this URL is
+    /// a sentence about a node, not a binary another machine will execute.
+    #[test]
+    fn a_webhook_address_is_a_scheme_and_a_host() {
+        assert!(webhook_ok("https://example.com/hook"));
+        assert!(webhook_ok("http://127.0.0.1:8080/alerts"));
+        assert!(webhook_ok("https://gotify.example.com/message?token=abc"));
+        // A bare host is what a paste out of a browser's address bar looks like
+        // when the scheme was in the part that got left behind.
+        assert!(!webhook_ok("example.com/hook"));
+        assert!(!webhook_ok("ftp://example.com/hook"));
+        assert!(!webhook_ok("https://"));
+        assert!(!webhook_ok("https:///hook"));
+        // Whitespace is what a copy out of a chat window brings with it, and a URL
+        // with one in it is not the URL the operator thinks they pasted.
+        assert!(!webhook_ok("https://example.com/hook "));
+        assert!(!webhook_ok("https://exa mple.com/hook"));
+        assert!(!webhook_ok(""));
+    }
+
+    /// The headers are the operator's own lines, and every self-hosted endpoint
+    /// documents them in this shape. A line the hub cannot parse is refused here
+    /// rather than dropped at send time, where the endpoint's 401 would be the
+    /// only sign of it.
+    #[test]
+    fn webhook_headers_are_name_colon_value_lines() {
+        assert!(headers_ok(""), "empty is the default: no extra headers");
+        assert!(headers_ok("Authorization: Bearer abc123"));
+        assert!(headers_ok("X-Gotify-Key: AbCdEf\nContent-Type: application/json"));
+        // The space after the colon is optional, and so is the value.
+        assert!(headers_ok("X-Token:"));
+        assert!(headers_ok("X-Token: "));
+        assert!(headers_ok("\n\nAuthorization: x\n\n"), "blank lines are padding, not headers");
+
+        assert!(!headers_ok("Authorization Bearer abc"), "no colon, so no name to send");
+        assert!(!headers_ok(": abc"), "a value with nothing to attach it to");
+        assert!(!headers_ok("Author ization: abc"), "a space is not allowed in a field name");
+        assert!(!headers_ok("Authorization: abc\nnot a header"));
     }
 
     /// Ids and nothing else. The pass parses this list every tick and skips what
@@ -1328,12 +1627,20 @@ mod tests {
         ];
         let messages = render(&owed);
         assert_eq!(messages.len(), 1);
-        let text = &messages[0];
+        let text = compose(&messages[0], HTML);
         assert!(text.starts_with("<b>离线</b>\n"), "{text}");
         let order: Vec<usize> =
             ["离线", "已恢复", "流量告警", "即将到期"].iter().map(|h| text.find(h).unwrap()).collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
         assert_eq!(text.matches("<b>").count(), 4);
+
+        // The same message for a channel that renders no markup: the headings
+        // stay, because they are what tells a reader what the lines below them
+        // are about, and only the tags go.
+        let plain = compose(&messages[0], PLAIN);
+        assert!(plain.starts_with("离线\n"), "{plain}");
+        assert!(!plain.contains('<') && !plain.contains('>'), "{plain}");
+        assert!(plain.contains("web 已离线 5 分钟"), "{plain}");
     }
 
     /// Telegram refuses an oversized message, so a pass with more to say than that
@@ -1352,11 +1659,12 @@ mod tests {
         let messages = render(&owed);
         assert!(messages.len() > 1, "one message for 400 nodes");
         for message in &messages {
-            assert!(message.len() <= BUDGET, "{} characters", message.len());
-            assert!(message.contains("<b>离线</b>"), "every message says what it is about");
+            let text = compose(message, HTML);
+            assert!(text.len() <= BUDGET, "{} characters", text.len());
+            assert!(text.contains("<b>离线</b>"), "every message says what it is about");
         }
         // Every line survives the split exactly once.
-        assert_eq!(messages.iter().map(|m| m.matches("已离线").count()).sum::<usize>(), 400);
+        assert_eq!(messages.iter().map(|m| m.len()).sum::<usize>(), 400);
     }
 
     /// The panel renders node names as text, and so must this: a name is the
@@ -1443,6 +1751,31 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
+    /// A stand-in for whatever the operator runs at the other end. Records the
+    /// headers as well as the body, because the headers are half of what a webhook
+    /// is configured with and the half nothing else would notice going missing.
+    async fn mock_webhook(
+        status: StatusCode,
+        answer: &'static str,
+    ) -> (String, Arc<Mutex<Vec<(axum::http::HeaderMap, Value)>>>) {
+        let seen: Arc<Mutex<Vec<(axum::http::HeaderMap, Value)>>> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sink = seen.clone();
+        let router = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+            let sink = sink.clone();
+            async move {
+                let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+                sink.lock().unwrap().push((headers, body));
+                (status, answer)
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
     const TOKEN: &str = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
     /// A hub with a bot configured, one node that has been quiet for ten minutes,
@@ -1455,6 +1788,16 @@ mod tests {
         app.db.set("alert_offline_minutes", "5").unwrap();
         let now = Utc::now().timestamp();
         app.db.touch_seen(id, now - 600).unwrap();
+        (app, id)
+    }
+
+    /// The same hub with the bot taken back out and a webhook put in its place, so
+    /// that a test can tell the two channels apart by which one is configured.
+    fn wired_webhook(url: &str) -> (App, i64) {
+        let (app, id) = wired();
+        app.db.set("alert_telegram_token", "").unwrap();
+        app.db.set("alert_telegram_chat", "").unwrap();
+        app.db.set("alert_webhook_url", url).unwrap();
         (app, id)
     }
 
@@ -1566,8 +1909,97 @@ mod tests {
         let (app, _) = wired();
         let rules = Rules::read(&app);
         // Port 1 on loopback is reserved and nothing here listens on it.
-        let failure = send(&app.http, "http://127.0.0.1:1", &rules, "hello").await.unwrap_err().to_string();
+        let failure =
+            send_telegram(&app.http, "http://127.0.0.1:1", &rules, "hello").await.unwrap_err().to_string();
         assert!(failure.contains("telegram request failed"), "{failure}");
         assert!(!failure.contains(TOKEN), "the token is in the URL and must not reach the log: {failure}");
+    }
+
+    /// A hub whose only channel is a webhook, and what that channel receives: the
+    /// message, plus the same message taken apart so that a script does not have
+    /// to split the text and guess which half is a node's name.
+    #[tokio::test]
+    async fn a_webhook_receives_the_message_and_the_same_thing_taken_apart() {
+        let (url, seen) = mock_webhook(StatusCode::OK, "ok").await;
+        let (app, _) = wired_webhook(&url);
+        app.db.set("alert_webhook_headers", "Authorization: Bearer s3cret\nX-Tag: home").unwrap();
+
+        let rules = Rules::read(&app);
+        assert!(rules.addressed(), "an address is all a webhook needs to be sent to");
+        once(&app, &url, &rules, Duration::from_secs(3_600)).await.unwrap();
+
+        {
+            let sent = seen.lock().unwrap();
+            assert_eq!(sent.len(), 1, "one pass, one request");
+            let (headers, body) = &sent[0];
+            // The operator's own lines, sent as written. Nothing else would notice
+            // one of them being dropped, because the receiver answers the same
+            // either way.
+            assert_eq!(headers.get("authorization").unwrap().to_str().unwrap(), "Bearer s3cret");
+            assert_eq!(headers.get("x-tag").unwrap().to_str().unwrap(), "home");
+            assert_eq!(body["hub"], "Monitor", "no site name is set, so the fallback names it");
+            assert_eq!(body["text"], "离线\nweb 已离线 10 分钟\n");
+            assert_eq!(body["lines"][0]["heading"], "离线");
+            assert_eq!(body["lines"][0]["text"], "web 已离线 10 分钟");
+        }
+
+        // Told once. The node is still down and the operator already knows.
+        once(&app, &url, &rules, Duration::from_secs(3_600)).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "an unchanged condition is not repeated");
+    }
+
+    /// Both channels are configured, and one of them is not there. The alert
+    /// reached the operator by the other route, so it has been delivered: retrying
+    /// in order to satisfy the broken one would repeat the working one every
+    /// thirty seconds, which turns one outage into a flood.
+    #[tokio::test]
+    async fn a_broken_second_channel_does_not_make_the_first_one_repeat() {
+        let (api, seen) = mock_telegram(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (app, id) = wired();
+        // Port 1 on loopback is reserved and nothing here listens on it.
+        app.db.set("alert_webhook_url", "http://127.0.0.1:1/hook").unwrap();
+        let rules = Rules::read(&app);
+        assert_eq!(rules.channels(), vec![Channel::Telegram, Channel::Webhook]);
+
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().len(), 1, "the channel that works got it");
+        assert!(
+            app.db.alert_states().unwrap()[&(id, "offline".to_owned())].notified > 0,
+            "and it is on record as told, which is what stops the repeat"
+        );
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "so the next pass says nothing");
+    }
+
+    /// A webhook that refuses the message leaves the alert owed, the same way a
+    /// refused chat does: nothing reached the operator, so nothing is recorded as
+    /// having been said.
+    #[tokio::test]
+    async fn a_refused_webhook_leaves_the_alert_owed() {
+        let (url, seen) = mock_webhook(StatusCode::UNAUTHORIZED, "bad key").await;
+        let (app, id) = wired_webhook(&url);
+        let rules = Rules::read(&app);
+
+        let failure = once(&app, &url, &rules, Duration::from_secs(3_600)).await.unwrap_err().to_string();
+        assert!(failure.contains("bad key"), "the receiver's own words name the problem: {failure}");
+        assert!(failure.contains("Webhook"), "and which channel said them: {failure}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        assert_eq!(app.db.alert_states().unwrap()[&(id, "offline".to_owned())].notified, 0);
+        assert!(once(&app, &url, &rules, Duration::from_secs(3_600)).await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2, "tried again");
+    }
+
+    /// The webhook URL is the operator's, and `?token=` is how half of these
+    /// endpoints authenticate -- so it carries a credential as often as not, and
+    /// this error is logged.
+    #[tokio::test]
+    async fn a_request_that_never_arrived_does_not_put_the_webhook_token_in_the_log() {
+        let (app, _) = wired();
+        let rules = Rules { webhook: "http://127.0.0.1:1/hook?token=s3cret".into(), ..rules() };
+        let failure = send_webhook(&app.http, &rules, "Monitor", "hello", &[]).await.unwrap_err().to_string();
+        assert!(failure.contains("webhook request failed"), "{failure}");
+        assert!(!failure.contains("s3cret"), "the token is in the URL and must not reach the log: {failure}");
     }
 }

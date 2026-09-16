@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Textarea } from "@/components/ui/textarea"
 import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
@@ -1335,6 +1336,37 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
     save({ alert_muted_nodes: next })
   }
 
+  // One button, shown in both channel cards. The hub sends the test on every
+  // configured channel, so which card it sits under says nothing about what it
+  // reaches -- and an operator who has only a webhook should not have to look for
+  // it inside the Telegram card.
+  function testButton() {
+    return (
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={testing}
+        onClick={async () => {
+          setTesting(true)
+          try {
+            await api("/alerts/test", { method: "POST" })
+            toast.success("已发送，去配置的渠道看一眼")
+          } catch (e) {
+            // The channel's own refusal, verbatim: it is the only thing that says
+            // which field is wrong. With two channels configured the message names
+            // the one that failed, so a new webhook is not blamed on the bot.
+            toast.error((e as Error).message)
+          } finally {
+            setTesting(false)
+          }
+        }}
+      >
+        <Send className="size-4" />
+        {testing ? "发送中…" : "发送测试消息"}
+      </Button>
+    )
+  }
+
   return (
     <div className="space-y-4">
       <Card className="gap-4 p-5">
@@ -1374,31 +1406,58 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
           >
             保存
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={testing}
-            onClick={async () => {
-              setTesting(true)
-              try {
-                await api("/alerts/test", { method: "POST" })
-                toast.success("已发送，去 Telegram 看一眼")
-              } catch (e) {
-                // Telegram's own refusal, verbatim: it is the only thing that
-                // says which of the two fields is wrong.
-                toast.error((e as Error).message)
-              } finally {
-                setTesting(false)
-              }
-            }}
-          >
-            <Send className="size-4" />
-            {testing ? "发送中…" : "发送测试消息"}
-          </Button>
+          {testButton()}
         </div>
         <p className="text-xs leading-relaxed text-muted-foreground">
-          测试用的是已保存的配置，不是上面输入框里的内容——先保存再测试。
+          测试用的是已保存的配置，不是上面输入框里的内容——先保存再测试。配了 Webhook 的话，
+          这条也会一并发过去。
         </p>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">Webhook</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            除 Telegram 之外，再往任意 HTTP 地址推一份。每次告警发一个 POST，请求体是 JSON：
+            <code className="rounded bg-muted px-1">hub</code> 是本站点名称，
+            <code className="rounded bg-muted px-1">text</code> 是整条消息，
+            <code className="rounded bg-muted px-1">lines</code> 是拆开的分组，每条带
+            <code className="rounded bg-muted px-1">heading</code> 和
+            <code className="rounded bg-muted px-1">text</code>，省得对面再按换行去猜哪半截是节点名。
+            地址留空就不发。两个渠道各自独立，一个发不出去不影响另一个。
+          </p>
+        </div>
+        <Field label="地址" hint="http:// 或 https://">
+          <Input
+            value={value("alert_webhook_url")}
+            onChange={(e) => set("alert_webhook_url", e.target.value)}
+            placeholder="https://example.com/hook"
+          />
+        </Field>
+        <Field label="请求头" hint="每行一条，留空则只有 Content-Type">
+          <Textarea
+            value={value("alert_webhook_headers")}
+            onChange={(e) => set("alert_webhook_headers", e.target.value)}
+            placeholder={"Authorization: Bearer …\nX-Gotify-Key: …"}
+            rows={3}
+            className="font-mono text-xs"
+          />
+        </Field>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            onClick={() =>
+              save({
+                ...patch(),
+                alert_webhook_url: value("alert_webhook_url"),
+                alert_webhook_headers: value("alert_webhook_headers"),
+              })
+            }
+          >
+            保存
+          </Button>
+          {testButton()}
+        </div>
       </Card>
 
       <Card className="gap-4 p-5">
