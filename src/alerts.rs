@@ -486,7 +486,8 @@ impl Finding {
         self.node = node.id;
         self.label = label(node);
         if !self.state.is_empty() {
-            self.line = format!("{} {}", self.label, self.line);
+            // A space jams the name and the figure together in chat; a colon would fight expiry dates.
+            self.line = format!("{} · {}", self.label, self.line);
         }
         self
     }
@@ -685,7 +686,8 @@ fn clear_line(finding: &Finding, stored: Option<&AlertState>, now: i64) -> Strin
     match stored.map(|s| human(now.saturating_sub(s.since))) {
         // The heading above already says "已恢复", so the line spends its words on
         // the one thing the heading cannot say: how long the node was away.
-        Some(away) => format!("{} 离线 {away}", finding.label),
+        Some(away) => format!("{} · 离线 {away}", finding.label),
+
         // Unreachable: a state is only cleared against the row that recorded it,
         // and `record` drops a quiet finding that has no row. The name on its own
         // is still a whole line under that heading rather than a broken one.
@@ -875,25 +877,27 @@ fn render(owed: &[Finding]) -> Vec<Message<'_>> {
     let mut current: Message<'_> = Vec::new();
     let mut weight = 0;
     for (_, heading, line) in ordered {
-        // What the line costs the message it is about to join: itself and its
-        // newline, plus -- where its heading is not already open there -- the
-        // heading, its tags, and the blank line that separates it from the group
-        // above. A message with nothing in it has no heading open, so the line that
-        // begins one pays for a heading too.
+        // What the line costs the message it is about to join: itself, the dotted
+        // prefix compose adds, and its newline, plus -- where its heading is not
+        // already open there -- the heading, its tags, and the blank line that
+        // separates it from the group above. A message with nothing in it has no
+        // heading open, so the line that begins one pays for a heading too.
         let opens = match current.last() {
             None => true,
             Some((open, _)) => *open != heading,
         };
         let mut added = line.len()
             + 1
+            + "· ".len()
             + if opens { heading.len() + 8 + if current.is_empty() { 0 } else { 1 } } else { 0 };
         if !current.is_empty() && weight + added > BUDGET {
             messages.push(std::mem::take(&mut current));
             weight = 0;
             // The line now opens a message of its own, which means it pays for the
             // heading it was going to inherit.
-            added = line.len() + 1 + heading.len() + 8;
+            added = line.len() + 1 + "· ".len() + heading.len() + 8;
         }
+
         weight += added;
         current.push((heading, line));
     }
@@ -923,6 +927,8 @@ fn compose(message: &Message<'_>, tag: (&str, &str)) -> String {
             out.push('\n');
             open = heading;
         }
+        // Presentation only: Finding.line and webhook lines[].text stay unprefixed.
+        out.push_str("· ");
         out.push_str(line);
         out.push('\n');
     }
@@ -1059,7 +1065,8 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
         return (StatusCode::BAD_REQUEST, "先填写 Bot Token 和 Chat ID，或 Webhook 地址").into_response();
     }
     let hub = hub_name(&app);
-    let text = format!("{hub} 测试消息\n收到这条说明告警已经接通。");
+    let text = format!("{hub}\n告警测试\n收到这条说明通道已经接通。");
+
     let mut failures = Vec::new();
     for channel in rules.channels() {
         let sent = match channel {
@@ -1485,7 +1492,8 @@ mod tests {
         let states = app.db.alert_states().unwrap();
         let back = record(&app, &states, vec![find("")], now + 600).unwrap();
         assert_eq!(back.len(), 1);
-        assert_eq!(back[0].line, "web 离线 10 分钟");
+        assert_eq!(back[0].line, "web · 离线 10 分钟");
+
         app.db.alert_notified(id, "offline", now + 600).unwrap();
 
         // And the quiet that follows is not news either.
@@ -1509,14 +1517,14 @@ mod tests {
         // never reaches `alert_notified` and the row stays owed.
         let states = app.db.alert_states().unwrap();
         let back = record(&app, &states, vec![find("")], now + 600).unwrap();
-        assert_eq!(back[0].line, "web 离线 10 分钟");
+        assert_eq!(back[0].line, "web · 离线 10 分钟");
 
         // The retry half a minute later says the same thing. How long ago the
         // message was first attempted is not how long the node was down.
         let states = app.db.alert_states().unwrap();
         let retry = record(&app, &states, vec![find("")], now + 630).unwrap();
         assert_eq!(retry.len(), 1, "still owed");
-        assert_eq!(retry[0].line, "web 离线 10 分钟");
+        assert_eq!(retry[0].line, "web · 离线 10 分钟");
     }
 
     /// A quota coming back under its threshold is the operator's own doing, and
@@ -1609,7 +1617,8 @@ mod tests {
             Finding {
                 kind: "offline",
                 state: "offline",
-                line: "web 已离线 5 分钟".into(),
+                line: "web · 已离线 5 分钟".into(),
+
                 ..Finding::quiet("offline")
             },
             Finding {
@@ -1640,7 +1649,7 @@ mod tests {
         let plain = compose(&messages[0], PLAIN);
         assert!(plain.starts_with("离线\n"), "{plain}");
         assert!(!plain.contains('<') && !plain.contains('>'), "{plain}");
-        assert!(plain.contains("web 已离线 5 分钟"), "{plain}");
+        assert!(plain.contains("web · 已离线 5 分钟"), "{plain}");
     }
 
     /// Telegram refuses an oversized message, so a pass with more to say than that
@@ -1821,11 +1830,9 @@ mod tests {
             assert_eq!(body["link_preview_options"]["is_disabled"], true);
             let text = body["text"].as_str().unwrap();
             assert!(text.starts_with("<b>离线</b>\n"), "{text}");
-            // The line as it lands, exactly: the node's name, then the wording,
-            // and nothing in front of either. A status prefix here is one the
-            // panel does not draw beside the same node, and the two are read side
-            // by side -- so the whole message is pinned rather than its parts.
-            assert_eq!(text, "<b>离线</b>\nweb 已离线 10 分钟\n");
+            // The line as it lands, exactly: a list mark, the node's name, a middle
+            // dot, then the wording. The whole message is pinned rather than its parts.
+            assert_eq!(text, "<b>离线</b>\n· web · 已离线 10 分钟\n");
         }
 
         // Told once. The node is still down and the operator already knows.
@@ -1857,7 +1864,7 @@ mod tests {
         once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
         let sent = seen.lock().unwrap();
         assert_eq!(sent.len(), 1, "unmuting reports the condition that holds");
-        assert_eq!(sent[0]["text"].as_str().unwrap(), "<b>离线</b>\nweb 已离线 10 分钟\n");
+        assert_eq!(sent[0]["text"].as_str().unwrap(), "<b>离线</b>\n· web · 已离线 10 分钟\n");
     }
 
     /// Muting is per node, not a switch for the feature: the same pass still
@@ -1876,7 +1883,8 @@ mod tests {
         let sent = seen.lock().unwrap();
         assert_eq!(sent.len(), 1, "the node that is not muted still gets through");
         let text = sent[0]["text"].as_str().unwrap();
-        assert!(text.contains("db 已离线"), "{text}");
+        assert!(text.contains("db · 已离线"), "{text}");
+
         assert!(!text.contains("web"), "{text}");
     }
 
@@ -1938,9 +1946,9 @@ mod tests {
             assert_eq!(headers.get("authorization").unwrap().to_str().unwrap(), "Bearer s3cret");
             assert_eq!(headers.get("x-tag").unwrap().to_str().unwrap(), "home");
             assert_eq!(body["hub"], "Monitor", "no site name is set, so the fallback names it");
-            assert_eq!(body["text"], "离线\nweb 已离线 10 分钟\n");
+            assert_eq!(body["text"], "离线\n· web · 已离线 10 分钟\n");
             assert_eq!(body["lines"][0]["heading"], "离线");
-            assert_eq!(body["lines"][0]["text"], "web 已离线 10 分钟");
+            assert_eq!(body["lines"][0]["text"], "web · 已离线 10 分钟");
         }
 
         // Told once. The node is still down and the operator already knows.
