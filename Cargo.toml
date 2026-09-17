@@ -6,7 +6,7 @@ name = "monitor-hub"
 # nothing about this number, so a release that forgets to bump it ships a binary
 # naming the previous one -- which is how this sat at 1.0.0 through v1.0.1 and
 # v1.0.2.
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 license = "MIT"
 description = "Lightweight server monitoring hub"
