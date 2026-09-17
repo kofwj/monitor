@@ -564,6 +564,9 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
+  // Reorder saves after this one, for the same reason the settings writes are
+  // serialised: the server stores the whole list per PUT.
+  const orderSaves = useRef(Promise.resolve())
   const byId = new Map(nodes.map((node) => [node.id, node]))
   const orderedIds = new Set(manualOrder)
   const order = [
@@ -608,8 +611,16 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     const rollback = orderBeforeDrag.current
     if (!rollback.length || ids.join() === rollback.join()) return
     orderBeforeDrag.current = ids
-    api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) }).then(refresh, (e: Error) => {
-      setManualOrder(rollback)
+    const run = orderSaves.current.then(async () => {
+      await api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) })
+      refresh()
+    })
+    orderSaves.current = run.catch(() => {})
+    run.catch((e: Error) => {
+      // Rolling back unconditionally would clobber a later drag whose save has
+      // already landed: only revert when this write is still the order on
+      // screen, so the older failure cannot overwrite the newer success.
+      setManualOrder((current) => (current.join() === ids.join() ? rollback : current))
       toast.error(e.message)
     })
   }
@@ -1168,17 +1179,30 @@ type Settings = Record<string, string | boolean>
 function useSettings(onSaved?: () => void) {
   const [s, setS] = useState<Settings | null>(null)
   useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
+  // Writes are serialised: the hub applies a PUT as a wholesale set of the
+  // keys it carries, so two overlapping saves could finish out of order and
+  // the last to arrive would decide the rows while the UI already showed the
+  // other. One save at a time, newest last, removes that class of divergence.
+  const updates = useRef(Promise.resolve())
   return {
     s,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
-    save: async (patch: Record<string, string>) => {
-      try {
+    // Re-reads the server's rows -- the way back from an optimistic update
+    // the hub refused.
+    reload: () => api<Settings>("/settings").then(setS).catch(() => {}),
+    // Resolves true only when the hub accepted the write, so a caller can act
+    // on the outcome rather than guessing from the toast.
+    save: (patch: Record<string, string>) => {
+      const run = updates.current.then(async () => {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
         toast.success("已保存")
         onSaved?.()
-      } catch (e) {
-        toast.error((e as Error).message)
-      }
+      })
+      updates.current = run.catch(() => {})
+      return run.then(() => true).catch((e: Error) => {
+        toast.error(e.message)
+        return false
+      })
     },
   }
 }
@@ -1313,7 +1337,7 @@ const ALERT_THRESHOLDS = [
 ] as const
 
 function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) {
-  const { s, set, save } = useSettings(refreshMe)
+  const { s, set, save, reload } = useSettings(refreshMe)
   const [testing, setTesting] = useState(false)
   if (!s) return null
 
@@ -1333,7 +1357,12 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
   function toggle(id: number) {
     const next = (muted.includes(id) ? muted.filter((v) => v !== id) : [...muted, id]).join(",")
     set("alert_muted_nodes", next)
-    save({ alert_muted_nodes: next })
+    // Optimistic, so the switch acts on the click. The PUT is serialised with
+    // every other settings write; if the hub still refuses, re-read the
+    // server's list because nothing else on this page does.
+    save({ alert_muted_nodes: next }).then((ok) => {
+      if (!ok) reload()
+    })
   }
 
   // One button, shown in both channel cards. The hub sends the test on every
@@ -1595,7 +1624,7 @@ function Security({ site, refreshMe }: { site: string; refreshMe: () => void }) 
           <Button
             size="sm"
             disabled={password.length < 12}
-            onClick={() => save({ admin_password: password }).then(() => setPassword(""))}
+            onClick={() => save({ admin_password: password }).then((ok) => { if (ok) setPassword("") })}
           >
             修改密码
           </Button>

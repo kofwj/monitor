@@ -217,8 +217,19 @@ export function useNodes() {
         return
       }
       socket.onmessage = (event) => {
-        const frame = JSON.parse(event.data)
-        setNodes(frame.nodes)
+        // A frame that is not JSON, or is JSON without the list, is not a live
+        // snapshot: either way, ignore it and keep what we have. Without the
+        // guard, a parse error throws inside onmessage and a frame missing
+        // `nodes` pushes the value to undefined, where App's `!nodes` branch
+        // replaces the whole panel with a skeleton until the next frame.
+        let frame: { nodes?: unknown; admin?: unknown }
+        try {
+          frame = JSON.parse(event.data)
+        } catch {
+          return
+        }
+        if (!Array.isArray(frame.nodes) || typeof frame.admin !== "boolean") return
+        setNodes(frame.nodes as Node[])
         setAdmin(frame.admin)
         setError(null)
         // The stream has returned; the poll was only covering for it.
