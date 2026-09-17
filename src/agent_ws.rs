@@ -25,7 +25,10 @@ use crate::{App, Shared};
 /// before abandoning the connection.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const SILENCE: Duration = Duration::from_secs(120);
-
+/// How long a flush may take before the connection is counted as dead. See
+/// [`send`]: the await happens inside `serve`'s `select!`, so an unbounded one
+/// would freeze the heartbeat and the receive alongside it.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Distinguishes one agent session on a node from the next. A connection can
 /// remain nominally open for up to SILENCE, long enough for the agent to have
 /// given up and reconnected; without this tag a late teardown would remove the
@@ -166,6 +169,20 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
+/// Sends one frame with a deadline. A peer that has stopped reading -- a dead
+/// TCP session with a full window, a stalled tunnel -- would otherwise park
+/// `serve`'s `select!` on whichever branch took it: the heartbeat would never
+/// be polled, no silence would ever be declared, and the node would sit
+/// "online" with frozen metrics until the kernel noticed hours later. A frame
+/// that cannot be flushed within [`SEND_TIMEOUT`] is a sign of life nobody is
+/// taking; drop the connection and let the agent reconnect.
+async fn send(socket: &mut WebSocket, message: Message) -> Result<()> {
+    tokio::time::timeout(SEND_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| anyhow::anyhow!("agent stopped reading its socket"))??;
+    Ok(())
+}
+
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
@@ -175,8 +192,9 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
     info!("node {node_id} connected from {ip}");
 
-    // Send the probe list before the first report arrives.
-    let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    // Send the probe list before the first report arrives. A hub unable to do
+    // even this has no working connection to hand the session to.
+    send(&mut socket, Message::Text(ping_tasks_message(&app, node_id).into())).await?;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
@@ -185,7 +203,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     let outcome = loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
-                Some(text) => socket.send(Message::Text(text.into())).await?,
+                Some(text) => send(&mut socket, Message::Text(text.into())).await?,
                 None => break Ok(()),
             },
             // A machine that leaves the network without closing its socket would
@@ -198,7 +216,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 if quiet > SILENCE {
                     break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
                 }
-                socket.send(Message::Ping(Vec::new().into())).await?;
+                send(&mut socket, Message::Ping(Vec::new().into())).await?;
             }
             inbound = socket.recv() => {
                 last_frame = Instant::now();
