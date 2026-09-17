@@ -236,7 +236,7 @@ pub async fn metrics(
     }
     // After the two point lookups above, so an unauthorised caller is told so
     // rather than asked to retry later.
-    let Ok(_permit) = HISTORY_GATE.try_acquire() else {
+    let Ok(permit) = HISTORY_GATE.try_acquire() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many history queries in flight, try again")
             .into_response();
     };
@@ -254,6 +254,12 @@ pub async fn metrics(
     // an await, so exactly four callers are inside it at once rather than however
     // many worker threads happen to exist.
     let built = tokio::task::spawn_blocking(move || {
+        // The permit travels with the scan rather than with the request. A
+        // client that disconnects abandons this handler while the scan it paid
+        // for keeps holding the write connection the agents report through;
+        // returning the permit with the handler would let four more scans pile
+        // on top of it.
+        let _permit = permit;
         // Probe names accompany the samples they label, so the page needs no
         // second request. Names only: targets and assignments remain behind
         // `Admin`. Skipped when probes were not requested, since the resources tab
@@ -1644,23 +1650,28 @@ pub async fn save_settings(
     // Set when the password changed, so the caller receives a fresh session rather
     // than being logged out by their own change.
     let mut reissued = String::new();
+    // The password is written last. Changing it drops every session, so a later
+    // write failing after it would leave the operator logged out everywhere,
+    // with only the one-time password and a restart to get back in. Written
+    // after everything else, a failure above it leaves signing in untouched.
+    let password = map.get("admin_password").and_then(Value::as_str);
     for (key, value) in map {
-        let value = value.as_str().unwrap_or_default();
-        // Changing the password logs out every existing session; the caller
-        // receives a replacement.
         if key == "admin_password" {
-            match hash_password(value).and_then(|h| {
-                app.db.set("admin_password_hash", &h)?;
-                app.db.drop_all_sessions()?;
-                issue_session(&app, &headers)
-            }) {
-                Ok(cookie) => reissued = cookie,
-                Err(e) => return fail(e),
-            }
             continue;
         }
+        let value = value.as_str().unwrap_or_default();
         if let Err(e) = app.db.set(key, value) {
             return fail(e);
+        }
+    }
+    if let Some(value) = password {
+        match hash_password(value).and_then(|h| {
+            app.db.set("admin_password_hash", &h)?;
+            app.db.drop_all_sessions()?;
+            issue_session(&app, &headers)
+        }) {
+            Ok(cookie) => reissued = cookie,
+            Err(e) => return fail(e),
         }
     }
     with_cookies(Json(json!({"ok": true})), [reissued])
