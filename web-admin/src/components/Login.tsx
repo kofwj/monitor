@@ -45,7 +45,10 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
   }
 
   return (
-    <div className="grid min-h-svh place-items-center p-6">
+    // `flex-1` rather than `min-h-svh`: the caller stacks a footer under this, so
+    // the card centres in the height left over instead of pushing the footer off
+    // the viewport.
+    <div className="grid flex-1 place-items-center p-6">
       <Card className="w-full max-w-sm gap-5 p-6">
         <h1 className="text-lg font-semibold">登录后台</h1>
 
