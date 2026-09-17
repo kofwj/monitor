@@ -45,26 +45,32 @@ function GitHubIcon({ className }: { className?: string }) {
   *  credentials and the one you land on right after an upgrade -- exactly when
   *  knowing the version matters most. */
 function Footer({ version }: { version?: string }) {
+  // Pinned to the viewport, not the document: a short login screen and a long
+  // node list would otherwise place this line at two different heights, and
+  // switching between them makes it jump. Content that would land under it
+  // is padded in the pages below.
   return (
-    <footer className="mx-auto w-full max-w-7xl px-4 pb-10 pt-2">
-      <p className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-        {version && <span className="tnum">v{version}</span>}
-        {version && <span aria-hidden="true">·</span>}
-        {/* The address is long and noisy at footer size; a small GitHub
-            icon says the same thing. The accessible name keeps the link
-            meaningful to screen readers, and the tooltip restores it for
-            anyone who wants to read where it goes. */}
-        <a
-          href={REPO}
-          target="_blank"
-          rel="noreferrer"
-          title={`GitHub 仓库（${REPO.replace("https://github.com/", "")}）`}
-          aria-label={`GitHub 仓库（${REPO.replace("https://github.com/", "")}）`}
-          className="inline-flex items-center rounded p-0.5 transition-colors hover:text-foreground"
-        >
-          <GitHubIcon className="size-3.5" />
-        </a>
-      </p>
+    <footer className="pointer-events-none fixed inset-x-0 bottom-0 z-10">
+      <div className="mx-auto flex w-full max-w-7xl items-center px-4 py-2.5">
+        <p className="pointer-events-auto flex items-center gap-x-2 rounded-md bg-background/80 px-2 py-1 text-xs text-muted-foreground backdrop-blur">
+          {version && <span className="tnum">v{version}</span>}
+          {version && <span aria-hidden="true">·</span>}
+          {/* The address is long and noisy at footer size; a small GitHub
+              icon says the same thing. The accessible name keeps the link
+              meaningful to screen readers, and the tooltip restores it for
+              anyone who wants to read where it goes. */}
+          <a
+            href={REPO}
+            target="_blank"
+            rel="noreferrer"
+            title={`GitHub 仓库（${REPO.replace("https://github.com/", "")}）`}
+            aria-label={`GitHub 仓库（${REPO.replace("https://github.com/", "")}）`}
+            className="inline-flex items-center rounded p-0.5 transition-colors hover:text-foreground"
+          >
+            <GitHubIcon className="size-3.5" />
+          </a>
+        </p>
+      </div>
     </footer>
   )
 }
@@ -161,13 +167,11 @@ export default function App() {
 
   if (!me.authed) {
     return (
-      // A column so the footer can sit at the bottom while `Login` keeps the card
-      // centred in what is left, rather than the two fighting over min-h-svh.
-      <div className="flex min-h-svh flex-col">
+      <>
         <Login github={me.github} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
         <Footer version={me.version} />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
-      </div>
+      </>
     )
   }
 
@@ -177,9 +181,8 @@ export default function App() {
     await api("/auth/logout", { method: "POST" }).catch(() => {})
     location.href = "/"
   }
-
   return (
-    <div className="min-h-svh">
+    <div className="min-h-svh pb-14">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
           {/* The site name is the way back to the status page, as in the
