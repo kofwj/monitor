@@ -1,6 +1,11 @@
 name: ci
 
 on:
+  # Also runnable by hand. A fork does not necessarily receive push events -- this
+  # repository's whole history is nine manual `release` runs and not one
+  # push-triggered run -- and a workflow that cannot be started by hand cannot be
+  # run there at all.
+  workflow_dispatch:
   push:
     branches: [main]
     # Prose changes nothing a compiler or linter can check.
