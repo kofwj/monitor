@@ -43,6 +43,12 @@ fn bad(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, message.to_owned()).into_response()
 }
 
+/// A write whose id named no row. The panel needs this apart from a success: it
+/// reloads on `ok`, and would otherwise redraw a node that is already gone.
+fn missing(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, message.to_owned()).into_response()
+}
+
 // ---- read paths, shared between the panel and the public page ----
 
 /// Everything a report may expose under `metrics` on the public page: the agent
@@ -690,7 +696,7 @@ pub async fn agent_register(
     if !provisioning_allowed(&app, &headers) {
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&app.trusted_proxies, &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -794,10 +800,11 @@ pub async fn update_node(
         return bad(&message);
     }
     match app.db.update_node(id, &node) {
-        Ok(()) => {
+        Ok(true) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
+        Ok(false) => missing("no such node"),
         Err(e) => fail(e),
     }
 }
@@ -829,10 +836,11 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // metrics. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
     match app.db.delete_node(id) {
-        Ok(()) => {
+        Ok(true) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
+        Ok(false) => missing("no such node"),
         Err(e) => fail(e),
     }
 }
@@ -843,10 +851,9 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 /// reinstall the agent. Reading the install command does not pass through here.
 pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let token = random_token();
-    let updated = app.db.node(id).map(|n| n.is_some()).unwrap_or(false);
-    if !updated {
-        return (StatusCode::NOT_FOUND, "no such node").into_response();
-    }
+    // Whether the node is there is answered by the write below rather than by a
+    // read before it: a node deleted between the two would otherwise be reported
+    // as rotated, and the panel would show a token nothing holds.
     // The token is checked only at the handshake, so a session opened with the
     // old one would continue reporting. Dropping the sender ends that loop; the
     // agent reconnects and is refused. Its own teardown leaves the entry
@@ -858,7 +865,8 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     match app.db.reset_token(id, &token) {
         // The token alone: the panel builds the command, and one place needs to
         // know its form.
-        Ok(()) => Json(json!({"token": token})).into_response(),
+        Ok(true) => Json(json!({"token": token})).into_response(),
+        Ok(false) => missing("no such node"),
         Err(e) => fail(e),
     }
 }
@@ -873,10 +881,11 @@ pub async fn patch_traffic(
         return bad("traffic must be non-negative");
     }
     match app.db.set_traffic(id, &p) {
-        Ok(()) => {
+        Ok(true) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
+        Ok(false) => missing("no such node"),
         Err(e) => fail(e),
     }
 }
@@ -952,10 +961,11 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
 
 pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.delete_ping_task(id) {
-        Ok(()) => {
+        Ok(true) => {
             agent_ws::push_ping_tasks(&app);
             Json(json!({"ok": true})).into_response()
         }
+        Ok(false) => missing("no such probe"),
         Err(e) => fail(e),
     }
 }
@@ -2950,5 +2960,51 @@ mod tests {
         // And clearing the expiry date stays possible.
         assert_eq!(patch(json!({"expires_at": null})).await.status(), StatusCode::OK);
         assert!(app.db.nodes().unwrap()[0].expires_at.is_none());
+    }
+
+    /// A write naming a node that is not there is a 404, not a success.
+    ///
+    /// The routes used to disagree: two answered `ok: true` for a write that
+    /// changed nothing, which left the panel redrawing a node that had already
+    /// been deleted, and `patch_traffic` answered 500 carrying rusqlite's own
+    /// "Query returned no rows".
+    #[tokio::test]
+    async fn a_write_naming_a_node_that_is_not_there_is_a_404() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let gone = id + 9_999;
+        let patch = |body: serde_json::Value| {
+            let patch = serde_json::from_value::<NodePatch>(body).unwrap();
+            update_node(Admin, State(app.clone()), Path(gone), Ok(Json(patch)))
+        };
+
+        let statuses = vec![
+            patch(json!({"name": "x"})).await.status(),
+            delete_node(Admin, State(app.clone()), Path(gone)).await.status(),
+            reset_token(Admin, State(app.clone()), Path(gone)).await.status(),
+            patch_traffic(
+                Admin,
+                State(app.clone()),
+                Path(gone),
+                Json(TrafficPatch { total_rx: Some(1), ..Default::default() }),
+            )
+            .await
+            .status(),
+            delete_ping_task(Admin, State(app.clone()), Path(gone)).await.status(),
+        ];
+        assert_eq!(statuses, vec![StatusCode::NOT_FOUND; statuses.len()]);
+
+        // A patch that changes nothing still matched a row: the operator must not
+        // be told the node is gone because they pressed save without editing.
+        assert_eq!(
+            update_node(Admin, State(app.clone()), Path(id), Ok(Json(NodePatch::default()))).await.status(),
+            StatusCode::OK,
+            "an empty patch still names the node it was sent to"
+        );
+
+        // A node that is there still answers, so the 404 is about the id rather
+        // than the route.
+        assert_eq!(delete_node(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        assert!(app.db.nodes().unwrap().is_empty());
     }
 }

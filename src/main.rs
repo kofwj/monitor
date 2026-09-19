@@ -57,10 +57,13 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// Which peers may set `X-Forwarded-For` on a caller's behalf: loopback, plus
+    /// whatever `--trusted-proxy` named. See [`auth::TrustedProxies`].
+    pub trusted_proxies: auth::TrustedProxies,
 }
 
 impl App {
-    fn new(db: Db, site: String, themes: PathBuf) -> Self {
+    fn new(db: Db, site: String, themes: PathBuf, trusted_proxies: auth::TrustedProxies) -> Self {
         Self {
             db,
             agents: RwLock::default(),
@@ -73,12 +76,13 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            trusted_proxies,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        Self::new(db, String::new(), PathBuf::from("themes"))
+        Self::new(db, String::new(), PathBuf::from("themes"), auth::TrustedProxies::default())
     }
 
     pub fn public_page(&self) -> bool {
@@ -396,6 +400,9 @@ struct Args {
     database: String,
     site: String,
     themes: PathBuf,
+    /// Who may set X-Forwarded-For on a caller's behalf: loopback, plus whatever
+    /// `--trusted-proxy` named. See [`auth::TrustedProxies`].
+    trusted_proxies: auth::TrustedProxies,
 }
 
 /// The default listen address. A v6 wildcard also accepts IPv4 through
@@ -418,6 +425,7 @@ fn parse_args() -> Result<Args> {
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
     let mut themes = None;
+    let mut trusted = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_default();
@@ -426,17 +434,25 @@ fn parse_args() -> Result<Args> {
             "--db" => database = value(),
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
+            "--trusted-proxy" => trusted.push(value()),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db]\n\
+                     [--themes themes] [--site https://hub.example.com]\n\
+                     [--trusted-proxy CIDR]...\n\n\
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
                      --site is only needed behind a reverse proxy, where the address the\n\
                      panel is reached on is not the one agents should use. Left out, the\n\
                      hub answers on whatever ip:port it is asked, and the panel builds\n\
-                     install commands from the address in the browser's bar.",
+                     install commands from the address in the browser's bar.\n\
+                     --trusted-proxy names a proxy whose X-Forwarded-For is believed:\n\
+                     an address or CIDR block, repeatable. A proxy on this host needs\n\
+                     nothing -- loopback is always trusted -- while one on another host,\n\
+                     or in a container, must be named: unlisted, its X-Forwarded-For is\n\
+                     ignored and every caller behind it throttles as one.",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -449,7 +465,17 @@ fn parse_args() -> Result<Args> {
     let themes = themes.unwrap_or_else(|| {
         std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
     });
-    Ok(Args { listen, listen_defaulted, database, site: site.trim_end_matches('/').to_owned(), themes })
+    Ok(Args {
+        listen,
+        listen_defaulted,
+        database,
+        site: site.trim_end_matches('/').to_owned(),
+        themes,
+        // Loopback plus whatever was named. A spec that does not parse fails the
+        // start rather than being skipped: this list is the whole of who may set
+        // the client address, and a typo in it is invisible from then on.
+        trusted_proxies: auth::TrustedProxies::from_specs(trusted)?,
+    })
 }
 
 #[tokio::main]
@@ -462,8 +488,18 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    // Named at startup because it decides who may speak for a caller, and the
+    // symptom of getting it wrong is silent: a proxy that is not listed has its
+    // X-Forwarded-For ignored, so every caller behind it shares one throttle
+    // bucket and the panel shows the proxy's address.
+    info!("X-Forwarded-For is trusted from: {}", args.trusted_proxies);
     std::fs::create_dir_all(&args.themes)?;
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
+    let app = Arc::new(App::new(
+        Db::open(&args.database)?,
+        args.site.clone(),
+        args.themes,
+        args.trusted_proxies.clone(),
+    ));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -483,10 +519,13 @@ async fn main() -> Result<()> {
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
-             this port directly and set their own X-Forwarded-Proto -- --listen 127.0.0.1:{} so the \
-             proxy is the only way in",
+             this port directly and set their own X-Forwarded-Proto and X-Forwarded-For -- \
+             --listen 127.0.0.1:{} so the proxy is the only way in. X-Forwarded-For is trusted from \
+             {}; a proxy of yours at any other address needs --trusted-proxy, or every request \
+             behind it throttles as one caller",
             args.listen,
-            args.listen.port()
+            args.listen.port(),
+            args.trusted_proxies
         );
     }
     // Checked once here, because the answer is static: `provisioning_allowed`
@@ -762,7 +801,7 @@ mod tests {
     use axum::http::{StatusCode, Uri};
 
     fn app(site: &str) -> App {
-        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"))
+        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"), Default::default())
     }
 
     /// A request as a reverse proxy would forward it, or as it arrives with none

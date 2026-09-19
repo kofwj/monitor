@@ -4,7 +4,7 @@
 //! broken OAuth app or an unreachable github.com cannot lock the owner out.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -166,7 +166,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&app.trusted_proxies, &headers, peer.ip());
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     }
@@ -369,12 +369,14 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
-/// through a local reverse proxy. Used for throttling and for the address shown
-/// beside a node, never for authorization.
+/// through a proxy named in `trust`. Used for throttling and for the address
+/// shown beside a node, never for authorization.
 ///
-/// The header is honoured only when the peer is itself local. Otherwise a
-/// caller could mint a fresh identity per request, bypassing the lockout and
-/// growing the throttle map without bound.
+/// The header is honoured only from a peer in `trust`; see [`TrustedProxies`] for
+/// why that is a list rather than a guess about the network. An untrusted peer
+/// gets nothing from it: honoured, the header would let a caller mint a fresh
+/// identity per request, bypassing the lockout and growing the throttle map
+/// without bound.
 ///
 /// The last value is taken, not the first. Both documented proxies append
 /// rather than replace -- nginx's `$proxy_add_x_forwarded_for`, caddy's
@@ -384,16 +386,17 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
 /// caller: rotating the header makes every attempt a fresh address, and writing
 /// the operator's address locks them out of the sign-in page.
 ///
-/// A second trusted proxy in front of the local one places its own address at
-/// the tail instead. No single value in this header identifies the client, so
+/// A second trusted proxy in front of the first places its own address at the
+/// tail instead. No single value in this header identifies the client, so
 /// such a deployment must have its edge write the client address.
 ///
-/// Both addresses are canonicalized: the default dual-stack `[::]` listener
-/// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which no IPv6
-/// range below recognizes as local.
-pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+/// Both addresses are canonicalized. The default dual-stack `[::]` listener
+/// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`; without this a
+/// loopback proxy would arrive looking like a v6 address that no v4 entry of
+/// the list matches.
+pub fn client_ip(trust: &TrustedProxies, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     let peer = peer.to_canonical();
-    if !behind_local_proxy(peer) {
+    if !trust.contains(peer) {
         return peer;
     }
     headers
@@ -404,15 +407,132 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
         .map_or(peer, |ip| ip.to_canonical())
 }
 
-/// Loopback or a private network, where a reverse proxy resides.
-fn behind_local_proxy(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        // Unique-local (fc00::/7) and link-local (fe80::/10); the stable
-        // standard library provides no predicate for either.
-        IpAddr::V6(v6) => {
-            let head = v6.segments()[0];
-            v6.is_loopback() || head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
+/// Which peers may set `X-Forwarded-For` on a caller's behalf.
+///
+/// A list rather than a guess about the network. This used to accept the header
+/// from any private address, reading "private" as "a reverse proxy of ours". It
+/// is not: it is every other machine on the LAN, on the VPN, and in the
+/// neighbouring container. Since `--listen` defaults to a wildcard, any of them
+/// could reach the port directly and mint a fresh client address per request,
+/// which is the whole of the sign-in lockout -- [`Throttle`] counts failures per
+/// address, so a caller free to choose its address is free to keep guessing.
+///
+/// Loopback is always trusted, which is the deployment `install-hub.sh` sets up:
+/// the proxy runs on this host and connects over 127.0.0.1. A proxy anywhere else
+/// has to be named, because nothing about its address says it is a proxy rather
+/// than a caller.
+#[derive(Clone, Debug)]
+pub struct TrustedProxies(Vec<Trusted>);
+
+/// One entry: an address, and how much of it has to match.
+#[derive(Clone, Copy, Debug)]
+struct Trusted {
+    addr: IpAddr,
+    bits: u8,
+}
+
+impl Default for TrustedProxies {
+    fn default() -> Self {
+        Self::loopback()
+    }
+}
+
+impl TrustedProxies {
+    pub fn loopback() -> Self {
+        Self(vec![
+            Trusted { addr: IpAddr::V4(Ipv4Addr::LOCALHOST), bits: 8 },
+            Trusted { addr: IpAddr::V6(Ipv6Addr::LOCALHOST), bits: 128 },
+        ])
+    }
+
+    /// Loopback, plus whatever `--trusted-proxy` names.
+    ///
+    /// Loopback is never dropped. A process on this host can read the database
+    /// outright, so believing it about a header grants nothing it did not already
+    /// have -- while a local proxy that silently stopped being trusted would
+    /// collapse every caller behind it into one throttle bucket, locking all of
+    /// them out the moment anyone mistypes a password five times.
+    ///
+    /// A spec that does not parse is an error rather than a skip: silently
+    /// trusting nobody, or somebody else, is exactly the change this list exists
+    /// to make visible.
+    pub fn from_specs<I: IntoIterator<Item = String>>(specs: I) -> Result<Self> {
+        let mut list = Self::loopback();
+        for spec in specs {
+            list.0.push(Trusted::parse(&spec)?);
+        }
+        Ok(list)
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.0.iter().any(|t| t.contains(ip))
+    }
+}
+
+impl std::fmt::Display for TrustedProxies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries: Vec<String> = self.0.iter().map(|t| format!("{}/{}", t.addr, t.bits)).collect();
+        f.write_str(&entries.join(", "))
+    }
+}
+
+/// Whether the first `bits` bits of two addresses agree. Slices rather than
+/// `Ipv4Addr`/`Ipv6Addr` because the arithmetic is the same for 32 bits and for
+/// 128, and one implementation is one place to go wrong.
+fn same_prefix(net: &[u8], got: &[u8], bits: u8) -> bool {
+    let whole = (bits / 8) as usize;
+    let rest = bits % 8;
+    // `rest == 0` short-circuits, so the partial byte is read only when there is
+    // one to read -- at 32 and 128 bits `whole` is already past the last byte.
+    net[..whole] == got[..whole] && (rest == 0 || (net[whole] >> (8 - rest)) == (got[whole] >> (8 - rest)))
+}
+
+impl Trusted {
+    fn parse(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        let (addr, len) = match spec.split_once('/') {
+            Some((addr, len)) => (addr, Some(len)),
+            None => (spec, None),
+        };
+        let addr: IpAddr = addr.parse().with_context(|| {
+            format!("--trusted-proxy {spec:?} is not an address or a CIDR block, e.g. 10.0.0.0/8 or ::1")
+        })?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let bits = match len {
+            Some(len) => len
+                .trim()
+                .parse::<u8>()
+                .with_context(|| format!("--trusted-proxy {spec:?} has an unreadable prefix length"))?,
+            None => max,
+        };
+        if bits > max {
+            bail!("--trusted-proxy {spec:?} has a longer prefix than the {max} bits of its address");
+        }
+        // A zero-length prefix is every address there is, which would put the header
+        // back under the caller's control -- the arrangement this list replaced.
+        // Nothing is a proxy at every address.
+        if bits == 0 {
+            bail!("--trusted-proxy {spec:?} would trust every caller; a proxy has an address");
+        }
+        // A v4-mapped entry can never match: the peer is canonicalized to its v4
+        // form before it is compared, so this is a trust entry that looks applied
+        // and does nothing.
+        if let IpAddr::V6(v6) = addr {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                bail!("--trusted-proxy {spec:?} is {v4} in v6 form; name it as a v4 address");
+            }
+        }
+        Ok(Self { addr, bits })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(got)) => same_prefix(&net.octets(), &got.octets(), self.bits),
+            (IpAddr::V6(net), IpAddr::V6(got)) => same_prefix(&net.octets(), &got.octets(), self.bits),
+            // Different families. The caller canonicalizes first, so this pairs an
+            // entry with a genuinely other address rather than with the v4-mapped
+            // form of a v4 one.
+            _ => false,
         }
     }
 }
@@ -545,37 +665,105 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_header_is_trusted_only_behind_a_local_proxy() {
+    fn forwarded_header_is_trusted_only_from_a_named_proxy() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let xff = |v: &str| {
             let mut h = HeaderMap::new();
             h.insert("x-forwarded-for", v.parse().unwrap());
             h
         };
+        // The default, which is what an unconfigured hub has.
+        let trust = TrustedProxies::loopback();
 
         // Nothing arrived with the request: the proxy appended the single
         // address it observed, which is the entire header.
-        assert_eq!(client_ip(&xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&trust, &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // The caller supplied a header of its own. Both documented proxies
         // append, so the fabricated value sits at the head and the proxy's
         // observation at the tail; reading the head would let a caller choose its
         // own throttle bucket each request, or claim the operator's address.
         let forged = xff("10.0.0.2, 198.51.100.9");
-        for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
-            assert_eq!(client_ip(&forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
+        for peer in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(client_ip(&trust, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
 
         // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
-        // which is the same local peer.
-        assert_eq!(client_ip(&forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(&HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        // which is the same loopback peer.
+        assert_eq!(client_ip(&trust, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
-        assert_eq!(client_ip(&forged, ip("203.0.113.5")), ip("203.0.113.5"));
-        assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
-        // No header at all: the peer address is used.
-        assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(client_ip(&trust, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(&trust, &forged, ip("2001:db8::5")), ip("2001:db8::5"));
+    }
+
+    /// A private address is not a proxy. It was believed as one, so any machine on
+    /// the LAN -- or the VPN, or the neighbouring container -- could pick its own
+    /// throttle bucket per request, and with `--listen` at its wildcard default it
+    /// could reach the port to do it.
+    #[test]
+    fn a_private_address_has_to_be_named_to_speak_for_the_caller() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "198.51.100.9".parse().unwrap());
+
+        let trust = TrustedProxies::loopback();
+        for peer in ["10.0.0.1", "192.168.1.5", "172.18.0.4", "fd00::1"] {
+            assert_eq!(client_ip(&trust, &h, ip(peer)), ip(peer), "{peer} is not a proxy by position");
+        }
+        // The dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`. The
+        // same address in another spelling, still not a proxy, and canonicalized
+        // before it is compared -- without that no v4 entry would ever match the
+        // loopback proxy.
+        assert_eq!(client_ip(&trust, &h, ip("::ffff:172.18.0.4")), ip("172.18.0.4"));
+
+        // Named, the same header from the same peer is believed -- and loopback
+        // stays in the list without being named.
+        let named = TrustedProxies::from_specs(["172.18.0.0/16".to_string()]).unwrap();
+        assert_eq!(client_ip(&named, &h, ip("172.18.0.4")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&named, &h, ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&named, &h, ip("10.0.0.1")), ip("10.0.0.1"), "a block not named is still not");
+    }
+
+    #[test]
+    fn a_trusted_proxy_spec_is_an_address_or_a_block() {
+        let have = |spec: &str, peer: &str| {
+            let trust = TrustedProxies::from_specs([spec.to_string()]).unwrap();
+            trust.contains(peer.parse::<IpAddr>().unwrap())
+        };
+
+        // A bare address is a block of one, and each family is compared to its own
+        // width.
+        assert!(have("10.0.0.1", "10.0.0.1") && !have("10.0.0.1", "10.0.0.2"));
+        assert!(have("10.0.0.0/8", "10.255.255.255") && !have("10.0.0.0/8", "11.0.0.0"));
+        assert!(have("2001:db8::/32", "2001:db8:ffff::1") && !have("2001:db8::/32", "2001:db9::1"));
+        // A prefix that is not a whole number of bytes: the partial byte is the one
+        // most likely to be compared wrongly.
+        assert!(have("192.168.1.128/25", "192.168.1.255") && !have("192.168.1.128/25", "192.168.1.127"));
+        assert!(have("2001:db8::/33", "2001:db8:7fff::1") && !have("2001:db8::/33", "2001:db8:8000::1"));
+        // Full length, where the comparison must not read past the last byte.
+        assert!(have("10.0.0.1/32", "10.0.0.1") && have("::1/128", "::1"));
+        // Families do not mix.
+        assert!(!have("10.0.0.0/8", "2001:db8::1") && !have("2001:db8::/32", "203.0.113.9"));
+        // A spec that does not parse is an error rather than a silent skip: this
+        // list is the whole of who may set the client address. So is one that parses
+        // and then trusts every caller, and one that parses into an address a peer
+        // can never arrive as.
+        for bad in [
+            "",
+            "   ",
+            "not-an-address",
+            "10.0.0.0/33",
+            "::1/129",
+            "10.0.0.0/x",
+            "10.0.0.0/",
+            "10.0.0.1:80",
+            "0.0.0.0/0",
+            "::/0",
+            "::ffff:10.0.0.1/96",
+        ] {
+            assert!(TrustedProxies::from_specs([bad.to_string()]).is_err(), "{bad}");
+        }
     }
 }

@@ -153,7 +153,7 @@ pub async fn handler(
         // The same response whether the token is malformed or merely unknown.
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
-    let ip = client_ip(&headers, peer.ip()).to_string();
+    let ip = client_ip(&app.trusted_proxies, &headers, peer.ip()).to_string();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
@@ -183,6 +183,31 @@ async fn send(socket: &mut WebSocket, message: Message) -> Result<()> {
     Ok(())
 }
 
+/// Holds a node's connection state for as long as `serve` runs, and gives it up
+/// on every way out of it.
+///
+/// A guard rather than a call at the end of the loop, because not every way out
+/// of `serve` is a `break`: the three `?` operators inside the loop return
+/// straight out of the function. Those four `break`s ran the release; those
+/// `?`s did not. A connection that died on its first send -- an agent that
+/// connects and then never reads, caught by [`SEND_TIMEOUT`] -- therefore left
+/// its entry in `app.agents` for the life of the process: shown online with its
+/// metrics frozen, and never announced as offline, because the offline rule
+/// reads a present entry as a connected machine.
+struct Connected {
+    app: Shared,
+    node_id: i64,
+    session: u64,
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        if release(&self.app, self.node_id, self.session) {
+            info!("node {} went offline", self.node_id);
+        }
+    }
+}
+
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
@@ -191,6 +216,8 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     // than the machine.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
     info!("node {node_id} connected from {ip}");
+    // Armed here, ahead of everything that can fail: see [`Connected`].
+    let _connected = Connected { app: app.clone(), node_id, session };
 
     // Send the probe list before the first report arrives. A hub unable to do
     // even this has no working connection to hand the session to.
@@ -240,9 +267,6 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
         }
     };
 
-    if release(&app, node_id, session) {
-        info!("node {node_id} went offline");
-    }
     outcome
 }
 
@@ -267,7 +291,17 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
 fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
-        "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
+        "hello" => {
+            // The shape check `report` applies, for the same reason: `params` is
+            // `#[serde(default)]`, so a frame without them deserialises to `Null`.
+            // `save_facts` now leaves a column alone when its key is absent, which
+            // bounds the damage -- but a malformed frame is the agent's bug either
+            // way, and the log is the only place it gets noticed.
+            if !rpc.params.is_object() {
+                anyhow::bail!("hello carries no object of facts");
+            }
+            return app.db.save_facts(node_id, &rpc.params, ip);
+        }
         "report" => report(app, node_id, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -500,6 +534,7 @@ pub fn push_ping_tasks(app: &App) {
 mod tests {
     use super::*;
     use crate::db::{Db, Node, PingTask};
+    use std::sync::Arc;
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
@@ -760,6 +795,49 @@ mod tests {
         assert_eq!(n.ip, "198.51.100.4");
     }
 
+    /// A `hello` that carries one field leaves the rest of the card alone.
+    ///
+    /// The agent sends what it knows, and a frame missing a key used to write the
+    /// column empty: eleven of these land in the panel and the public page as a
+    /// card, so one partial frame blanked a machine's hostname and its capacities
+    /// until the agent happened to reconnect.
+    #[test]
+    fn a_partial_hello_leaves_the_facts_it_does_not_mention_alone() {
+        let app = app();
+        let id = node(&app);
+        let full = json!({
+            "jsonrpc": "2.0", "method": "hello",
+            "params": {"hostname": "vps-1", "os": "Debian 12", "cpu_cores": 4, "mem_total": 2048}
+        });
+        dispatch(&app, id, "198.51.100.4", &full.to_string()).unwrap();
+
+        let partial = json!({"jsonrpc": "2.0", "method": "hello", "params": {"hostname": "vps-2"}});
+        dispatch(&app, id, "198.51.100.4", &partial.to_string()).unwrap();
+
+        let n = app.db.node(id).unwrap().unwrap();
+        assert_eq!(n.hostname, "vps-2", "the field it did carry is written");
+        assert_eq!(n.os, "Debian 12", "and the ones it did not are left standing");
+        assert_eq!(n.cpu_cores, 4);
+        assert_eq!(n.mem_total, 2048);
+    }
+
+    /// A `hello` without an object of facts is refused rather than read as a frame
+    /// that mentions nothing.
+    #[test]
+    fn a_hello_without_a_facts_object_is_refused() {
+        let app = app();
+        let id = node(&app);
+        for params in [json!(null), json!([1, 2]), json!("hostname")] {
+            let frame = json!({"jsonrpc": "2.0", "method": "hello", "params": params});
+            assert!(dispatch(&app, id, "ip", &frame.to_string()).is_err(), "{params} is not a facts object");
+        }
+        // The key omitted entirely, which `#[serde(default)]` turns into `Null`.
+        assert!(dispatch(&app, id, "ip", r#"{"jsonrpc":"2.0","method":"hello"}"#).is_err());
+        // An object is what it takes, empty included: every column is then left
+        // standing, which is the same answer as carrying nothing.
+        assert!(dispatch(&app, id, "ip", r#"{"jsonrpc":"2.0","method":"hello","params":{}}"#).is_ok());
+    }
+
     #[test]
     fn ping_results_are_recorded_and_bad_ones_ignored() {
         let app = app();
@@ -860,5 +938,49 @@ mod tests {
         assert!(dispatch(&app, id, "ip", "not json").is_err());
         // Unknown methods are ignored.
         assert!(dispatch(&app, id, "ip", r#"{"method":"whatever"}"#).is_ok());
+    }
+
+    /// A connection that dies before it ever settles still takes the node
+    /// offline.
+    ///
+    /// This is the shape of `serve`, and the reason its teardown is a guard: the
+    /// three `?` operators inside the loop return straight out of the function,
+    /// and `SEND_TIMEOUT` -- an agent that connects and then never reads -- is the
+    /// first thing that can fail. Skipped, the entry stayed in `app.agents` for
+    /// the life of the process: the node read as online with its metrics frozen,
+    /// and its offline rule never fired, because that rule reads a present entry
+    /// as a connected machine.
+    ///
+    /// Driven through the guard rather than through `serve`, which would need a
+    /// real `axum::WebSocket`; that type is only ever built by an HTTP upgrade, so
+    /// there is no way to hand `serve` a socket that refuses to read.
+    #[test]
+    fn a_connection_that_dies_before_it_settles_still_takes_the_node_offline() {
+        let app: Shared = Arc::new(app());
+        let id = node(&app);
+        let live = || app.agents.read().unwrap().contains_key(&id);
+
+        let (tx, _held) = mpsc::channel(1);
+        app.agents.write().unwrap().insert(id, Agent::new(1, tx));
+        assert!(live(), "the handshake puts the node online");
+
+        // The guard is armed as soon as the node is on record, so the `?` that
+        // follows is the one a refused send takes.
+        let outcome = (|| -> Result<()> {
+            let _connected = Connected { app: app.clone(), node_id: id, session: 1 };
+            anyhow::bail!("agent stopped reading its socket")
+        })();
+        assert!(
+            outcome.unwrap_err().to_string().contains("stopped reading"),
+            "the early return handed the failure out rather than swallowing it"
+        );
+        assert!(!live(), "and the node is offline again rather than stuck online");
+
+        // Not a blunt instrument: a session the agent already replaced by
+        // reconnecting releases nothing, exactly as `release` decides alone.
+        let (tx, _held) = mpsc::channel(1);
+        app.agents.write().unwrap().insert(id, Agent::new(6, tx));
+        drop(Connected { app: app.clone(), node_id: id, session: 1 });
+        assert!(live(), "the reconnected session stays online");
     }
 }

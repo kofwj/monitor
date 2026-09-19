@@ -647,8 +647,8 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<()> {
-        self.conn().execute(
+    pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<bool> {
+        let changed = self.conn().execute(
             "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
                              price=COALESCE(?5,price), currency=COALESCE(?6,currency),
                              billing_cycle=COALESCE(?7,billing_cycle),
@@ -673,12 +673,12 @@ impl Db {
                 n.traffic_reset_day
             ],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
-    pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
-        Ok(())
+    pub fn set_expiry(&self, id: i64, date: &str) -> Result<bool> {
+        let changed = self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
+        Ok(changed == 1)
     }
 
     pub fn reorder_nodes(&self, ids: &[i64]) -> Result<()> {
@@ -701,21 +701,21 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_node(&self, id: i64) -> Result<()> {
+    pub fn delete_node(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared explicitly. SQLite reassigns a
         // deleted node's id to the next node created, which would otherwise
         // inherit the removed machine's latency chart.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
-        conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
-        Ok(())
+        // The node's own delete, not the sweep above, is what says it was there.
+        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? == 1)
     }
 
     /// Replaces a node's token, which immediately locks out the old one.
-    pub fn reset_token(&self, id: i64, token: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])?;
-        Ok(())
+    pub fn reset_token(&self, id: i64, token: &str) -> Result<bool> {
+        let changed = self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])?;
+        Ok(changed == 1)
     }
 
     pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
@@ -737,21 +737,30 @@ impl Db {
         // every two seconds, so without a ceiling one node would determine that
         // frame's size. 128 rather than 64: a real PRETTY_NAME runs to about 60
         // characters and a CPU model to about 50.
+        //
+        // An absent key arrives as `None` -- not `""`/`0` -- and the `COALESCE`
+        // below turns that into "leave the column alone". Without it a `hello`
+        // carrying one field blanked the other ten: the panel and the public page
+        // read them straight into a card, so a partial frame wiped a machine's
+        // hostname and its capacities until the agent reconnected. A column is
+        // still cleared by an explicit value -- `""` for the strings, `0` for the
+        // numeric four -- while a JSON `null` now reads as an absent key does:
+        // both say this frame carries nothing about that column.
         let s = |k: &str| {
             f.get(k)
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(128)
-                .collect::<String>()
+                .map(|v| v.chars().filter(|c| !c.is_control()).take(128).collect::<String>())
         };
-        let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        let n = |k: &str| f.get(k).and_then(|v| v.as_i64());
         let conn = self.conn();
         conn.execute(
-            "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
-                             cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
-                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15,
+            "UPDATE node SET hostname=COALESCE(?2,hostname), os=COALESCE(?3,os),
+                             kernel=COALESCE(?4,kernel), arch=COALESCE(?5,arch),
+                             virt=COALESCE(?6,virt), cpu_name=COALESCE(?7,cpu_name),
+                             cpu_cores=COALESCE(?8,cpu_cores), mem_total=COALESCE(?9,mem_total),
+                             swap_total=COALESCE(?10,swap_total), disk_total=COALESCE(?11,disk_total),
+                             agent_version=COALESCE(?12,agent_version),
+                             ip=?13, ipv4=COALESCE(?14,ipv4), ipv6=COALESCE(?15,ipv6),
                              country=CASE WHEN ip=?13 THEN country ELSE '' END
              WHERE id=?1",
             params![
@@ -1043,19 +1052,24 @@ impl Db {
     /// they would belong to whichever period the row still held, `all_traffic`
     /// would read them back as zero, and the node's next report would restart the
     /// counter and discard the correction.
-    pub fn set_traffic(&self, node_id: i64, p: &TrafficPatch) -> Result<()> {
+    pub fn set_traffic(&self, node_id: i64, p: &TrafficPatch) -> Result<bool> {
         let conn = self.conn();
-        let reset_day: u32 =
-            conn.query_row("SELECT traffic_reset_day FROM node WHERE id=?1", [node_id], |r| r.get(0))?;
+        // `optional` rather than a bare `query_row`: a node that is not there is
+        // the panel's 404, where the missing-row error used to surface as a 500.
+        let reset_day: Option<u32> = conn
+            .query_row("SELECT traffic_reset_day FROM node WHERE id=?1", [node_id], |r| r.get(0))
+            .optional()?;
+        let Some(reset_day) = reset_day else { return Ok(false) };
         let period = period_start(Local::now().date_naive(), reset_day).to_string();
-        conn.execute(
+        // `traffic` carries a row per node from `create_node` on, so the affected
+        // count is this write's own answer.
+        Ok(conn.execute(
             "UPDATE traffic SET total_rx=COALESCE(?2,total_rx), total_tx=COALESCE(?3,total_tx),
                  month_rx=COALESCE(?4,CASE WHEN month_start=?6 THEN month_rx ELSE 0 END),
                  month_tx=COALESCE(?5,CASE WHEN month_start=?6 THEN month_tx ELSE 0 END), month_start=?6
              WHERE node_id=?1",
             params![node_id, p.total_rx, p.total_tx, p.month_rx, p.month_tx, period],
-        )?;
-        Ok(())
+        )? == 1)
     }
 
     // ---- metrics ----
@@ -1177,10 +1191,16 @@ impl Db {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let id = if t.id > 0 {
-            tx.execute(
+            let matched = tx.execute(
                 "UPDATE ping_task SET name=?2, target=?3, interval=?4 WHERE id=?1",
                 params![t.id, t.name, t.target, t.interval],
             )?;
+            if matched != 1 {
+                // An unknown id used to fall through to the assignment writes
+                // below and report success carrying the id it was handed; with no
+                // nodes assigned, the foreign key never fires either.
+                anyhow::bail!("探测任务 {} 不存在", t.id);
+            }
             t.id
         } else {
             tx.execute(
@@ -1229,11 +1249,12 @@ impl Db {
     ///
     /// The delete is a scan -- the key begins at `node_id` -- comparable in cost
     /// to `prune`, for an action taken manually a few times a year.
-    pub fn delete_ping_task(&self, id: i64) -> Result<()> {
+    pub fn delete_ping_task(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
         conn.execute("DELETE FROM ping_record WHERE task_id = ?1", [id])?;
-        conn.execute("DELETE FROM ping_task WHERE id=?1", [id])?;
-        Ok(())
+        // Whether a probe matched, which is the panel's 404 rather than an
+        // acknowledgement of a delete that removed nothing.
+        Ok(conn.execute("DELETE FROM ping_task WHERE id=?1", [id])? == 1)
     }
 
     /// The task list pushed to one agent.
@@ -2601,5 +2622,46 @@ mod tests {
         // Editing an existing probe does not count as adding one.
         let first = db.ping_tasks().unwrap()[0].id;
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
+    }
+
+    /// Every write that names a row reports whether one matched.
+    ///
+    /// The panel turns `false` into a 404. Without it a write against an id that
+    /// never existed answered `ok: true` -- and the routes disagreed among
+    /// themselves, one of them returning a 500 carrying rusqlite's own "Query
+    /// returned no rows".
+    #[test]
+    fn a_write_reports_whether_the_row_it_named_was_there() {
+        let db = db();
+        let id = node(&db, 1);
+        let gone = id + 9_999;
+        let price = |v: f64| NodePatch { price: Some(v), ..Default::default() };
+        let traffic = || TrafficPatch { total_rx: Some(1), ..Default::default() };
+
+        assert!(!db.update_node(gone, &price(20.0)).unwrap(), "an update of a node that is not there");
+        assert!(!db.set_expiry(gone, "2027-01-01").unwrap());
+        assert!(!db.reset_token(gone, "tok").unwrap());
+        assert!(!db.set_traffic(gone, &traffic()).unwrap(), "nor a correction of its traffic");
+        assert!(!db.delete_node(gone).unwrap());
+        assert!(!db.delete_ping_task(gone).unwrap(), "nor a delete of a probe");
+
+        // The same calls against the node that is there.
+        assert!(db.update_node(id, &price(20.0)).unwrap());
+        assert!(db.set_expiry(id, "2027-01-01").unwrap());
+        assert!(db.reset_token(id, "tok").unwrap());
+        assert!(db.set_traffic(id, &traffic()).unwrap());
+        assert!(db.delete_node(id).unwrap());
+
+        // A probe id that names nothing is refused rather than answered with the id
+        // it was handed: with no nodes assigned, the foreign key never fires either.
+        let orphan = PingTask {
+            id: gone,
+            name: "x".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![],
+        };
+        let err = db.save_ping_task(&orphan).unwrap_err().to_string();
+        assert!(err.contains("不存在"), "{err}");
     }
 }
