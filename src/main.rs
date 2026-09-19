@@ -615,7 +615,6 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
-        .route("/api/alerts/test", post(alerts::test))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))

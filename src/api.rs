@@ -12,7 +12,7 @@ use axum::Json;
 use chrono::{Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::agent_ws::Agent;
 use crate::auth::{
@@ -915,14 +915,6 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(false) => return missing("no such node"),
         Err(e) => return fail(e),
     }
-    // The node is gone from the row, but the mute list holds ids and SQLite hands
-    // this one to the next node created: an entry left here would silence a machine
-    // nobody muted, and nothing would say so. The delete has landed already, so a
-    // failure to clean the list is logged rather than answered -- the panel's node
-    // is gone either way, and the entry is one its list can still be edited to drop.
-    if let Err(e) = crate::alerts::unmute(&app, id) {
-        warn!("node {id} was deleted but its alert mute entry was not dropped: {e:#}");
-    }
     // The token is checked only at the handshake, so deleting the row does not
     // end a connection already open on it; dropping the sender does. Without
     // this the agent would keep reporting under an id SQLite reassigns to the
@@ -1074,19 +1066,15 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
-    // The alert thresholds, from the module that reads them: a key listed there
-    // and not here is one the alert page could never load.
-    "alert_telegram_chat",
-    "alert_webhook_url",
-    "alert_webhook_headers",
+    // The one rule this fork's engine judges, and the three thresholds it no
+    // longer does: those are `notify`'s, and the panel reads them only to offer to
+    // clear them. A key listed in `alerts::SETTINGS` and not here is one the page
+    // could never load.
     "alert_offline_minutes",
     "alert_traffic_percent",
     "alert_expiry_days",
     "alert_resource_percent",
     "alert_resource_minutes",
-    // Ids, not names: the alert page writes this from the node list it already
-    // has, and a node that is renamed keeps its mute.
-    "alert_muted_nodes",
 ];
 
 // ---- the database itself ----
@@ -1624,12 +1612,6 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
     );
-    // Write-only for the same reason, and reported the same way: the alert page
-    // needs to say "已设置，留空不变" without ever holding the credential.
-    out.insert(
-        "alert_telegram_set".into(),
-        json!(app.db.get("alert_telegram_token").is_some_and(|v| !v.is_empty())),
-    );
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
     // both names.
@@ -1674,39 +1656,14 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
-        // The bot token is write-only, so it is not in `READABLE_SETTINGS`; the
-        // shape is checked here because nothing but Telegram ever sees the value,
-        // and a token with a character missing fails as a bare 404 from an
-        // endpoint that does not name the setting responsible.
-        "alert_telegram_token" if !(value.is_empty() || crate::alerts::token_ok(value)) => {
-            Some("Bot Token 形如 123456789:AA…，请从 @BotFather 整条复制".into())
-        }
-        "alert_telegram_token" => None,
-        // A chat the bot has not been added to is a 400 from Telegram and nothing
-        // in the hub's own log, which is the same failure with a worse message.
-        "alert_telegram_chat" if !(value.is_empty() || crate::alerts::chat_ok(value)) => {
-            Some("Chat ID 是数字（群组为负数）或 @频道名".into())
-        }
-        // The hub posts to this on every pass, and a typo fails as a request error
-        // in its journal that does not name the setting -- which reads exactly like
-        // an endpoint that is down, a thing an operator may be living with on
-        // purpose and therefore will not go looking for.
-        //
-        // http:// is accepted here where `github_proxy` insists on https://. What
-        // travels this URL is a sentence about which of the operator's nodes went
-        // down; what travels that one is a binary their nodes will execute.
-        "alert_webhook_url" if !(value.is_empty() || crate::alerts::webhook_ok(value)) => {
-            Some("Webhook 地址要以 http:// 或 https:// 开头，并带上主机名".into())
-        }
-        // Checked rather than accepted blindly, for the same reason as the URL: the
-        // headers are rebuilt on every pass, where a line with no colon is dropped
-        // in silence -- and the receiver's 401 is the only sign that one went.
-        "alert_webhook_headers" if !crate::alerts::headers_ok(value) => {
-            Some("请求头每行一条，形如 Name: value".into())
-        }
         // Every threshold is a whole number of minutes, percent or days, and zero
         // is off -- the same way a node with a traffic limit of zero has no limit.
         // An empty value is how the panel clears one, and reads as zero.
+        //
+        // The first three are left over from the old 「告警」 page: offline, traffic
+        // and expiry are `notify`'s rules now, and zero is the only value the panel
+        // still writes here -- it is what the 清零 button sends, and what keeps an
+        // upgraded hub from announcing those three events twice.
         "alert_offline_minutes" if !threshold(value, 0, 10_080) => {
             Some("离线阈值是 0 到 10080 之间的分钟数，0 表示关闭".into())
         }
@@ -1721,12 +1678,6 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "alert_resource_minutes" if !threshold(value, 0, 1_440) => {
             Some("持续时间是 0 到 1440 之间的分钟数，0 表示首次采样即告警".into())
-        }
-        // Checked rather than accepted blindly: the pass parses this on every
-        // tick and skips whatever does not parse, so a typo would mute a
-        // different set of nodes than the page shows, silently.
-        "alert_muted_nodes" if !crate::alerts::muted_ok(value) => {
-            Some("静音列表是逗号分隔的节点编号".into())
         }
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
@@ -2521,20 +2472,6 @@ mod tests {
         assert!(public.contains(r#""country":"CN""#), "{public}");
     }
 
-    /// Deleting a node takes it out of the alert mute list. The list holds ids and
-    /// SQLite hands a deleted node's id to the next node created, so an entry left
-    /// behind would mute a machine nobody muted; see `alerts::unmute`.
-    #[tokio::test]
-    async fn deleting_a_node_drops_its_mute_entry() {
-        let app = std::sync::Arc::new(app());
-        let id = node(&app, "muted", true);
-        app.db.set("alert_muted_nodes", &format!("{id}")).unwrap();
-
-        let deleted = delete_node(Admin, axum::extract::State(app.clone()), Path(id)).await;
-        assert_eq!(deleted.status(), StatusCode::OK);
-        assert_eq!(app.db.get("alert_muted_nodes").as_deref(), Some(""));
-    }
-
     /// A stream outlives the request that opened it, so everything the handshake
     /// tested must be re-read rather than captured -- both answers, not one. The
     /// admin frame carries every node's token in the clear, and the public frame
@@ -3038,12 +2975,12 @@ mod tests {
         }
     }
 
-    /// The alert page and this route keep separate lists of the same keys, and
-    /// each way they can disagree is silent: a key this route does not recognise
-    /// is a field that can be typed into and never saved, and one it does not hand
-    /// back is a field that reloads blank however many times it is saved.
+    /// The page and this route keep separate lists of the same keys, and each way
+    /// they can disagree is silent: a key this route does not recognise is a field
+    /// that can be typed into and never saved, and one it does not hand back is a
+    /// field that reloads blank however many times it is saved.
     #[tokio::test]
-    async fn the_alert_page_and_the_settings_route_agree_on_which_keys_exist() {
+    async fn the_page_and_the_settings_route_agree_on_which_keys_exist() {
         let app = app();
         for key in crate::alerts::SETTINGS {
             assert!(
@@ -3051,15 +2988,12 @@ mod tests {
                 "{key} is written by the alert page and refused as an unknown setting"
             );
             assert!(
-                key == "alert_telegram_token" || READABLE_SETTINGS.contains(&key),
+                READABLE_SETTINGS.contains(&key),
                 "{key} is saved by the alert page and never handed back"
             );
         }
-        // And the one secret among them reports that it is set without being it.
-        app.db.set("alert_telegram_token", "1:abcdefghijklmnopqrstuvwxyz0123456789").unwrap();
-        let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
-        assert_eq!(body["alert_telegram_set"], true);
-        assert!(!body.to_string().contains("abcdefghijklmnopqrstuvwxyz"));
+        // Nothing here is write-only any more: the alert channels moved to `notify`,
+        // whose own secrets report their `_set` flags from `notify::settings`.
     }
 
     /// A token that is nearly right fails at Telegram as a bare 404 naming
@@ -3069,15 +3003,6 @@ mod tests {
     fn an_alert_setting_out_of_range_or_misshapen_is_refused_rather_than_stored() {
         let app = app();
         let bad = |key: &str, value: &str| setting_error(&app, key, &json!(value)).is_some();
-
-        assert!(!bad("alert_telegram_token", "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"));
-        assert!(!bad("alert_telegram_token", ""));
-        assert!(bad("alert_telegram_token", "123456789:AAHdqTcvCH1vGWJxfSeo"));
-        assert!(bad("alert_telegram_token", "nonsense"));
-
-        assert!(!bad("alert_telegram_chat", "-1001234567890"));
-        assert!(!bad("alert_telegram_chat", ""));
-        assert!(bad("alert_telegram_chat", "alerts"));
 
         // Zero is off and is the default, so it has to be storable.
         for key in [

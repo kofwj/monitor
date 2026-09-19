@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, BellRing, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -12,7 +12,6 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Textarea } from "@/components/ui/textarea"
 import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
@@ -305,8 +304,8 @@ function NodeForm({ node, onClose, onSaved }: {
               </label>
               <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
                 <span>
-                  <span className="block font-medium">离线通知</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期、恢复时各推一条</span>
+                  <span className="block font-medium">通知</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">离线/恢复、流量、到期、占用超阈值各推一条</span>
                 </span>
                 <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
               </label>
@@ -1534,8 +1533,8 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
   return (
     <Card className="gap-4 p-5">
       <div>
-        <h3 className="text-sm font-medium">离线通知</h3>
-        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
+        <h3 className="text-sm font-medium">按节点开关</h3>
+        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关；关掉的节点任何一类通知都不发。已打开 {enabled.size} / {nodes.length} 台</p>
       </div>
       <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
     </Card>
@@ -1553,6 +1552,16 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
     Object.fromEntries(keys.filter((k) => typeof s[k] === "string" && s[k] !== "").map((k) => [k, text(k)]))
   const secretHint = (k: string) => (s[`${k}_set`] ? "已设置，留空不变" : "未设置")
 
+  // The three rules this page owns now (they have their own thresholds above).
+  // A number stored for them by the deleted 告警 page still makes the old engine
+  // announce the same event a second time, so the card below offers to clear it.
+  const LEGACY: Record<string, string> = {
+    alert_offline_minutes: "离线阈值",
+    alert_traffic_percent: "流量阈值",
+    alert_expiry_days: "到期提醒",
+  }
+  const leftover = Object.keys(LEGACY).filter((k) => text(k) !== "" && text(k) !== "0")
+
   async function test() {
     setTesting(true)
     try {
@@ -1567,20 +1576,20 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 
   return (
     <div className="space-y-4">
-
-      {/* Both pages are offered and they are two separate systems, which is not
-          visible from either page alone -- hence the note here and on 告警. */}
+      {/* One notification surface now: the fork's resource rules deliver through
+          this page's channels and templates, so there is no second page to point
+          at and nothing that can be configured twice. */}
       <div className="rounded-md border border-dashed px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-        这一页负责<b>离线与恢复、流量、到期、登录提醒</b>，消息按下面的模板发送，可以自己改。
-        <b>CPU / 内存 / 硬盘持续超阈值</b>在另一页「告警」，它有自己的渠道与按节点静音；
-        事件不重不漏，是因为每一类规则只归一边 —— 那边若还留着旧版设过的离线/流量/到期阈值，那一页会提示清零。
+        这一页是<b>唯一的通知页</b>：<b>离线与恢复、流量、到期、登录提醒</b>，加上
+        <b>资源占用阈值（CPU / 内存 / 硬盘持续超阈值）</b>，全在这里配置。
+        渠道（Telegram / Webhook）、消息模板、逐节点开关也都在这，每条规则只发一份。
       </div>
       <Card className="gap-4 p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h3 className="text-sm font-medium">通知渠道</h3>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
+              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。按节点开关在下方；流量和到期提醒对填了额度、到期日的节点生效。
             </p>
           </div>
           <Button size="sm" variant="secondary" disabled={testing} onClick={test}>
@@ -1672,8 +1681,6 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         </div>
       </ChannelCard>
 
-      <OfflineNodes nodes={nodes} refresh={refresh} />
-
       <Card className="gap-4 p-5">
         <h3 className="text-sm font-medium">事件</h3>
         <div className="grid gap-4 sm:grid-cols-3">
@@ -1707,6 +1714,76 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           </Button>
         </div>
       </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">资源占用</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            这一页现在管全部通知：离线与恢复、流量、到期、登录提醒，以及 CPU / 内存 / 硬盘持续超阈值。
+            资源占用那两条由本 fork 的判定逻辑每 30 秒检查一次（读数超过阈值并持续够久才推），
+            消息按上面的模板发出去；填 0 表示关闭该条。
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="CPU / 内存 / 硬盘超过">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                value={text("alert_resource_percent")}
+                onChange={(e) => set("alert_resource_percent", e.target.value)}
+                placeholder="90"
+              />
+              <span className="shrink-0 text-sm text-muted-foreground">%</span>
+            </div>
+          </Field>
+          <Field label="且持续">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                value={text("alert_resource_minutes")}
+                onChange={(e) => set("alert_resource_minutes", e.target.value)}
+                placeholder="5"
+              />
+              <span className="shrink-0 text-sm text-muted-foreground">分钟</span>
+            </div>
+          </Field>
+        </div>
+        {leftover.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed">
+            <span className="min-w-0 flex-1">
+              这里还留着旧「告警」页的阈值：{leftover.map((k) => `${LEGACY[k]} ${text(k)}`).join("、")}。
+              离线、流量、到期这三类现在是这一页自己的规则，上面各有自己的阈值；旧值留着的话，
+              旧系统会把同一件事再报一遍 —— 清零即可。
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                save({ alert_offline_minutes: "0", alert_traffic_percent: "0", alert_expiry_days: "0" })
+              }
+            >
+              清零
+            </Button>
+          </div>
+        )}
+        <div>
+          <Button
+            size="sm"
+            onClick={() =>
+              save({
+                alert_resource_percent: text("alert_resource_percent"),
+                alert_resource_minutes: text("alert_resource_minutes"),
+              })
+            }
+          >
+            保存资源占用
+          </Button>
+        </div>
+      </Card>
+
+      <OfflineNodes nodes={nodes} refresh={refresh} />
     </div>
   )
 }
@@ -1762,279 +1839,6 @@ function Sessions() {
         ))}
       </div>
     </Card>
-  )
-}
-
-// Every threshold is a number the hub reads as "off" when it is zero, the same
-// way a node with a traffic limit of zero has no limit. An emptied field saves as
-// "", which the hub reads as zero too, so clearing one is how a rule is switched
-// off without the field disappearing.
-// Only the resource rules: offline, traffic and expiry are the 通知 page's, and
-// two systems announcing one event send it twice. Their keys stay readable (an
-// engine still reads them, and the page offers to clear a value left over from
-// before the split) but this page no longer writes them.
-const ALERT_THRESHOLDS = [
-  { key: "alert_resource_percent", label: "CPU / 内存 / 硬盘超过", unit: "%", placeholder: "90" },
-  { key: "alert_resource_minutes", label: "且持续", unit: "分钟", placeholder: "5" },
-] as const
-
-/** The three rules the 通知 page owns. Any of them still holding a number here
- * makes this system announce the same event a second time. */
-const LEGACY_KEYS = ["alert_offline_minutes", "alert_traffic_percent", "alert_expiry_days"] as const
-const LEGACY_LABELS: Record<string, string> = {
-  alert_offline_minutes: "离线阈值",
-  alert_traffic_percent: "流量阈值",
-  alert_expiry_days: "到期提醒",
-}
-
-function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) {
-  const { s, set, save, reload } = useSettings(refreshMe)
-  const [testing, setTesting] = useState(false)
-  if (!s) return null
-
-  // `||` rather than `??`: the hub returns "" for a key that was never set, and
-  // the placeholder is what an operator should see as the suggested value.
-  const value = (key: string) => String(s[key] ?? "")
-  const patch = () => Object.fromEntries(ALERT_THRESHOLDS.map(({ key }) => [key, value(key)]))
-
-  // What the split left behind: a number stored for a rule the 通知 page now owns
-  // still drives this engine, so the same outage would be announced by both. Zero
-  // is how this hub switches a rule off, which makes clearing the value the whole
-  // fix -- offered here rather than left for an operator to know to do.
-  const legacy = LEGACY_KEYS.filter((k) => Number(value(k)) > 0)
-  const legacyPatch = () => Object.fromEntries(LEGACY_KEYS.map((k) => [k, "0"]))
-
-  // Ids, not names: a node keeps its mute when it is renamed. Stored as the
-  // comma-separated list the hub validates, parsed back for the switches.
-  const muted = value("alert_muted_nodes").split(",").map((v) => v.trim()).filter(Boolean).map(Number)
-
-  // Written on the spot rather than behind a save button, because a switch that
-  // does not act until something else is pressed is one an operator leaves in the
-  // wrong position. The hub drops what the node remembered, so turning it back on
-  // reports whatever still holds instead of staying silent.
-  function toggle(id: number) {
-    const next = (muted.includes(id) ? muted.filter((v) => v !== id) : [...muted, id]).join(",")
-    set("alert_muted_nodes", next)
-    // Optimistic, so the switch acts on the click. The PUT is serialised with
-    // every other settings write; if the hub still refuses, re-read the
-    // server's list because nothing else on this page does.
-    save({ alert_muted_nodes: next }).then((ok) => {
-      if (!ok) reload()
-    })
-  }
-
-  // One button, shown in both channel cards. The hub sends the test on every
-  // configured channel, so which card it sits under says nothing about what it
-  // reaches -- and an operator who has only a webhook should not have to look for
-  // it inside the Telegram card.
-  function testButton() {
-    return (
-      <Button
-        size="sm"
-        variant="outline"
-        disabled={testing}
-        onClick={async () => {
-          setTesting(true)
-          try {
-            await api("/alerts/test", { method: "POST" })
-            toast.success("已发送，去配置的渠道看一眼")
-          } catch (e) {
-            // The channel's own refusal, verbatim: it is the only thing that says
-            // which field is wrong. With two channels configured the message names
-            // the one that failed, so a new webhook is not blamed on the bot.
-            toast.error((e as Error).message)
-          } finally {
-            setTesting(false)
-          }
-        }}
-      >
-        <Send className="size-4" />
-        {testing ? "发送中…" : "发送测试消息"}
-      </Button>
-    )
-  }
-
-  return (
-    <div className="space-y-4">
-
-
-      {/* The division of labour with the 通知 page, said here as well because an
-          operator who lands on this page alone would otherwise configure the two
-          systems to announce the same event. */}
-      <div className="rounded-md border border-dashed px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-        这一页是本 fork 的告警，只管 <b>CPU / 内存 / 硬盘持续超阈值</b>（文案固定、不含图标，按状态变化去重），
-        渠道和按节点静音都是这一套自己的。<b>离线与恢复、流量、到期、登录提醒在「通知」页</b>，那一套有自己的
-        渠道、阈值与可编辑模板 —— 两边各发一份只在同一类事件被两处都配时才发生。
-      </div>
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">Telegram 机器人</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            在 Telegram 里找 <code className="rounded bg-muted px-1">@BotFather</code> 建一个机器人，把整条 token 复制过来；
-            再对机器人说句话，然后用 <code className="rounded bg-muted px-1">@userinfobot</code> 查自己的 Chat ID。
-            群组要先把机器人拉进去，Chat ID 是负数。这一页的渠道只用于资源占用告警；离线、流量、到期走「通知」页。
-          </p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Bot Token" hint={s.alert_telegram_set ? "已设置，留空不变" : "未设置"}>
-            <Input
-              type="password"
-              placeholder={s.alert_telegram_set ? "••••••••" : "123456789:AA…"}
-              onChange={(e) => set("alert_telegram_token", e.target.value)}
-            />
-          </Field>
-          <Field label="Chat ID" hint="私聊是数字，群组是负数，公开频道可以填 @频道名">
-            <Input value={value("alert_telegram_chat")} onChange={(e) => set("alert_telegram_chat", e.target.value)} placeholder="-1001234567890" />
-          </Field>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            size="sm"
-            onClick={() => {
-              const body = patch()
-              // Only sent when typed. The hub never hands the token back, so an
-              // untouched field is empty and would otherwise clear it.
-              if (typeof s.alert_telegram_token === "string" && s.alert_telegram_token) {
-                body.alert_telegram_token = s.alert_telegram_token
-              }
-              body.alert_telegram_chat = value("alert_telegram_chat")
-              save(body)
-            }}
-          >
-            保存
-          </Button>
-          {testButton()}
-        </div>
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          测试用的是已保存的配置，不是上面输入框里的内容——先保存再测试。配了 Webhook 的话，
-          这条也会一并发过去。
-        </p>
-      </Card>
-
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">Webhook</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            除 Telegram 之外，再往任意 HTTP 地址推一份。每次告警发一个 POST，请求体是 JSON：
-            <code className="rounded bg-muted px-1">hub</code> 是本站点名称，
-            <code className="rounded bg-muted px-1">text</code> 是整条消息，
-            <code className="rounded bg-muted px-1">lines</code> 是拆开的分组，每条带
-            <code className="rounded bg-muted px-1">heading</code> 和
-            <code className="rounded bg-muted px-1">text</code>，省得对面再按换行去猜哪半截是节点名。
-            地址留空就不发。两个渠道各自独立，一个发不出去不影响另一个。
-          </p>
-        </div>
-        <Field label="地址" hint="http:// 或 https://">
-          <Input
-            value={value("alert_webhook_url")}
-            onChange={(e) => set("alert_webhook_url", e.target.value)}
-            placeholder="https://example.com/hook"
-          />
-        </Field>
-        <Field label="请求头" hint="每行一条，留空则只有 Content-Type">
-          <Textarea
-            value={value("alert_webhook_headers")}
-            onChange={(e) => set("alert_webhook_headers", e.target.value)}
-            placeholder={"Authorization: Bearer …\nX-Gotify-Key: …"}
-            rows={3}
-            className="font-mono text-xs"
-          />
-        </Field>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            size="sm"
-            onClick={() =>
-              save({
-                ...patch(),
-                alert_webhook_url: value("alert_webhook_url"),
-                alert_webhook_headers: value("alert_webhook_headers"),
-              })
-            }
-          >
-            保存
-          </Button>
-          {testButton()}
-        </div>
-      </Card>
-
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">触发条件</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            这一页只做<b>资源占用</b>：每 30 秒检查一遍，读数超过阈值并持续够久才推送，且只在状态变化时推一次。
-            填 0 表示关闭该条。离线与恢复、流量、到期、登录提醒由「通知」页负责，那边有自己的阈值和文案模板。
-          </p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          {ALERT_THRESHOLDS.map(({ key, label, unit, placeholder }) => (
-            <Field key={key} label={label}>
-              <div className="flex items-center gap-2">
-                <Input
-                  type="number"
-                  min={0}
-                  value={value(key)}
-                  onChange={(e) => set(key, e.target.value)}
-                  placeholder={placeholder}
-                />
-                <span className="shrink-0 text-sm text-muted-foreground">{unit}</span>
-              </div>
-            </Field>
-          ))}
-        </div>
-        {legacy.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed">
-            <span className="min-w-0 flex-1">
-              这里还留着旧版配置的阈值：{legacy.map((k) => `${LEGACY_LABELS[k]} ${value(k)}`).join("、")}。
-              这几类现在归「通知」页管，但旧值仍会让这一套再发一份 —— 清零即交给它。
-            </span>
-            <Button size="sm" variant="outline" onClick={() => save(legacyPatch())}>
-              清零
-            </Button>
-          </div>
-        )}
-        <div>
-          <Button size="sm" onClick={() => save(patch())}>
-            保存触发条件
-          </Button>
-        </div>
-      </Card>
-
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">节点</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            关掉的节点不参与<b>这一页</b>的告警：CPU / 内存 / 硬盘占用不会推送，适合临时节点或者还在调试的
-            机器。重新打开后，当前仍然成立的情况会立刻播报一次，不用等它再发生一遍。离线、流量、到期的
-            逐节点开关在节点弹窗里，那一条由「通知」页那套使用。
-          </p>
-        </div>
-        {nodes.length === 0 ? (
-          <p className="text-sm text-muted-foreground">还没有节点。</p>
-        ) : (
-          <div className="space-y-2">
-            {nodes.map((node) => (
-              <div
-                key={node.id}
-                className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
-              >
-                <span className="flex min-w-0 items-center gap-2 text-sm">
-                  <span
-                    className={`size-2 shrink-0 rounded-full ${node.online ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
-                    title={node.online ? "在线" : "离线"}
-                  />
-                  <span className="truncate">{node.name}</span>
-                </span>
-                <Switch
-                  checked={!muted.includes(node.id)}
-                  onCheckedChange={() => toggle(node.id)}
-                  aria-label={`${node.name} 的告警`}
-                />
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-    </div>
   )
 }
 
@@ -2287,14 +2091,11 @@ function Data() {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
-  // Two notification surfaces, on purpose. Upstream's page owns offline/recovery,
-  // traffic, expiry and login, with editable templates; this fork's 告警 page owns
-  // the resource thresholds it has no rule for. Either is a complete system on its
-  // own, and the overlap is invisible from one page alone, so each header says
-  // what it owns and what happens when both are configured.
+  // One notification surface: upstream's page owns offline/recovery, traffic,
+  // expiry and login with editable templates, and the fork's resource rules now
+  // deliver through those same channels.
   { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
-  { path: "/admin/alerts", label: "告警", icon: BellRing },
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
   { path: "/admin/settings", label: "设置", icon: Settings },
@@ -2345,8 +2146,6 @@ export function Admin({
           <Notify nodes={nodes} refresh={refresh} />
         ) : path === "/admin/data" ? (
           <Data />
-        ) : path === "/admin/alerts" ? (
-          <Alerts refreshMe={refreshMe} nodes={nodes} />
         ) : path === "/admin/themes" ? (
           <Themes />
         ) : path === "/admin/security" ? (

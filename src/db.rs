@@ -1061,17 +1061,6 @@ impl Db {
         Ok(())
     }
 
-    /// Marks a decision as told. Written after the message is away rather than
-    /// with the decision, because between the two is an HTTP request that can
-    /// fail: a row written told before it was sent would drop the alert.
-    pub fn alert_notified(&self, node: i64, kind: &str, ts: i64) -> Result<()> {
-        self.conn().execute(
-            "UPDATE alert_state SET notified = ?3 WHERE node_id = ?1 AND kind = ?2",
-            params![node, kind, ts],
-        )?;
-        Ok(())
-    }
-
     /// Drops what a rule remembers, so that switching it back on announces the
     /// conditions that hold now -- a node that is down, a quota already passed --
     /// rather than waiting for each to happen a second time. `None` forgets every
@@ -1085,22 +1074,6 @@ impl Db {
                 self.conn().execute("DELETE FROM alert_state", [])?;
             }
         }
-        Ok(())
-    }
-
-    /// Drops what one node remembers, for a node the operator has muted.
-    ///
-    /// The same reasoning as [`forget_alerts`], one node at a time: unmuting has
-    /// to announce the conditions that hold then, not the ones that held when the
-    /// node was muted. A node that was down for the whole muted period should say
-    /// so once, rather than stay silent because a row written before the mute
-    /// still agrees with it.
-    ///
-    /// Called every pass for every muted node. The statement is a no-op once the
-    /// rows are gone, and a muted node is one an operator asked to stop hearing
-    /// about, so the set is expected to be small.
-    pub fn forget_alerts_of(&self, node: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM alert_state WHERE node_id = ?1", [node])?;
         Ok(())
     }
 
