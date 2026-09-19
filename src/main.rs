@@ -236,6 +236,10 @@ static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RE
 ///
 /// Deliberately generous, since a node on a slow link must still transfer
 /// 1.8 MB; what it rules out is a transfer that never completes.
+///
+/// This bounds the body, not the permit. The permit is taken before the fetch,
+/// which carries a timeout of its own, so one request holds a slot for both in
+/// sequence: about 300 seconds, not 180.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Most this route will buffer from one release.
@@ -428,13 +432,18 @@ fn parse_args() -> Result<Args> {
     let mut trusted = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
-        let mut value = || it.next().unwrap_or_default();
+        // Named, because of what `--listen` with nothing after it used to
+        // produce: `parse::<SocketAddr>()` answering "invalid socket address
+        // syntax", which names no argument, over five flags that take a value.
+        let mut value = |flag: &str| -> Result<String> {
+            it.next().ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
+        };
         match arg.as_str() {
-            "--listen" => listen = Some(value()),
-            "--db" => database = value(),
-            "--site" => site = value(),
-            "--themes" => themes = Some(PathBuf::from(value())),
-            "--trusted-proxy" => trusted.push(value()),
+            "--listen" => listen = Some(value("--listen")?),
+            "--db" => database = value("--db")?,
+            "--site" => site = value("--site")?,
+            "--themes" => themes = Some(PathBuf::from(value("--themes")?)),
+            "--trusted-proxy" => trusted.push(value("--trusted-proxy")?),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
@@ -494,6 +503,11 @@ async fn main() -> Result<()> {
     // bucket and the panel shows the proxy's address.
     info!("X-Forwarded-For is trusted from: {}", args.trusted_proxies);
     std::fs::create_dir_all(&args.themes)?;
+
+    // A killed install strands one of its working directories and nothing else
+    // ever reclaims it; `frontend::discard_leftovers` says why the sweep is here
+    // rather than at the start of each install.
+    frontend::discard_leftovers(&args.themes);
     let app = Arc::new(App::new(
         Db::open(&args.database)?,
         args.site.clone(),
@@ -592,8 +606,8 @@ async fn main() -> Result<()> {
         // A report is a few hundred bytes; anything larger is not a report.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         // The two chunked uploads, merged after that layer rather than beneath
-        // it. They raise the ceiling on a single request -- one 4 MiB piece --
-        // not on the file behind it: a 256 MiB backup arrives as 64 such
+        // it. They raise the ceiling on a single request -- one `MAX_CHUNK` --
+        // not on the file behind it: a 256 MiB backup arrives as 32 such
         // requests, so no reverse proxy needs to know the database size. The
         // whole-file ceilings live on `total` and are checked before the first
         // byte is sent.

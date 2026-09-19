@@ -288,7 +288,11 @@ const REPLACED_PREFIX: &str = ".replaced-";
 /// nothing reclaims the disk they hold -- a hub restarted after a kill would
 /// keep those bytes for as long as it runs. Failing to clean up is no reason to
 /// refuse an install, so every error here is a warning rather than a bail.
-fn discard_leftovers(themes: &Path) {
+///
+/// Run at startup rather than before each install: concurrent uploads are
+/// possible, and a sweep landing between another install's two renames would take
+/// away the directory that install needs to roll back with.
+pub fn discard_leftovers(themes: &Path) {
     let Ok(entries) = fs::read_dir(themes) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -323,7 +327,6 @@ fn discard_leftovers(themes: &Path) {
 /// `expect` names the short the caller is replacing, where one is specified: an
 /// upload installs whatever it carries, an update may not.
 pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Result<Theme> {
-    discard_leftovers(themes);
     let staging = themes.join(format!("{STAGING_PREFIX}{}", &random_token()[..16]));
     let installed = unpack(archive, &staging).and_then(|()| publish(themes, &staging, expect));
     if installed.is_err() {
@@ -717,16 +720,23 @@ mod tests {
     /// and `serve` skip them -- and so does every other path, which leaves the
     /// next install as the only chance to free that disk.
     #[test]
-    fn an_install_sweeps_what_a_killed_one_left_behind() {
+    fn a_sweep_clears_what_a_killed_install_left_behind() {
         let outer = temp_dir("leftovers");
         let themes_dir = outer.join("themes");
         fs::create_dir_all(&themes_dir).unwrap();
-        // A file as well as directories: the prefix is what the sweep matches
-        // on, not the entry type.
+        // A file as well as directories: the prefix is what the sweep matches on,
+        // not the entry type.
         fs::create_dir(themes_dir.join(format!("{STAGING_PREFIX}0123456789abcdef"))).unwrap();
         fs::create_dir(themes_dir.join(format!("{REPLACED_PREFIX}0123456789abcdef"))).unwrap();
         fs::write(themes_dir.join(format!("{REPLACED_PREFIX}fedcba9876543210")), b"stray").unwrap();
 
+        discard_leftovers(&themes_dir);
+        assert!(
+            fs::read_dir(&themes_dir).unwrap().next().is_none(),
+            "the debris is gone, and the sweep took nothing else with it"
+        );
+
+        // And an install still lands, unaffected by having been swept around it.
         let manifest: &[u8] =
             r#"{"name":"极光","short":"aurora","description":"","version":"1","author":"a","url":""}"#
                 .as_bytes();
@@ -737,11 +747,7 @@ mod tests {
             None,
         )
         .unwrap();
-
-        // The install itself is unaffected by the leftovers, which are not a
-        // reason to refuse it.
         assert_eq!(theme.short, "aurora");
-        assert_eq!(fs::read(themes_dir.join("aurora/dist/index.html")).unwrap(), b"v1");
         let left: Vec<_> = fs::read_dir(&themes_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())

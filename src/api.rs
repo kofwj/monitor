@@ -932,6 +932,12 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     if task.name.is_empty() || task.target.is_empty() {
         return bad("name and target are required");
     }
+    // The name is a chart label on the public page, so it takes the bound a node
+    // name takes -- and the same control-character filter, which is what keeps a
+    // pasted newline out of the anonymous frame.
+    if let Some(message) = node_text_error(Some(&task.name), None, None, None, None) {
+        return bad(&message);
+    }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
     if !valid_target(&task.target) {
@@ -3006,5 +3012,28 @@ mod tests {
         // than the route.
         assert_eq!(delete_node(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         assert!(app.db.nodes().unwrap().is_empty());
+    }
+
+    /// A probe name reaches the anonymous public frame as a chart label, so it is
+    /// bounded like a node name rather than taken as the caller typed it.
+    #[tokio::test]
+    async fn a_probe_name_takes_the_same_bound_as_a_node_name() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let probe = |name: String| {
+            save_ping_task(
+                Admin,
+                State(app.clone()),
+                Json(PingTask { id: 0, name, target: "1.1.1.1:443".into(), interval: 60, nodes: vec![id] }),
+            )
+        };
+
+        assert_eq!(probe("A".repeat(MAX_NAME)).await.status(), StatusCode::OK);
+        assert_eq!(probe("A".repeat(MAX_NAME + 1)).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            probe("monitor\u{7}".to_owned()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "a control character"
+        );
     }
 }
