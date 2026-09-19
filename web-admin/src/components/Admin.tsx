@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { BellRing, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Bell, BellRing, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -303,10 +303,13 @@ function NodeForm({ node, onClose, onSaved }: {
                 </span>
                 <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
               </label>
-              {/* No per-node 离线通知 switch here: it belongs to `/admin/notify`, which
-                  this panel does not offer. The 告警 page's per-node mute is the switch
-                  that means something in this build, and `node.notify` stays in the row
-                  and in the save body for upstream's own feature. */}
+              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+                <span>
+                  <span className="block font-medium">离线通知</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期、恢复时各推一条</span>
+                </span>
+                <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
+              </label>
             </div>
           </section>
           <section className="space-y-3 border-t pt-5">
@@ -1564,6 +1567,14 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 
   return (
     <div className="space-y-4">
+
+      {/* Both pages are offered and they are two separate systems, which is not
+          visible from either page alone -- hence the note here and on 告警. */}
+      <div className="rounded-md border border-dashed px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+        这一页负责<b>离线与恢复、流量、到期、登录提醒</b>，消息按下面的模板发送，可以自己改。
+        <b>CPU / 内存 / 硬盘持续超阈值</b>在另一页「告警」，它有自己的渠道与按节点静音；
+        事件不重不漏，是因为每一类规则只归一边 —— 那边若还留着旧版设过的离线/流量/到期阈值，那一页会提示清零。
+      </div>
       <Card className="gap-4 p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
@@ -1758,13 +1769,23 @@ function Sessions() {
 // way a node with a traffic limit of zero has no limit. An emptied field saves as
 // "", which the hub reads as zero too, so clearing one is how a rule is switched
 // off without the field disappearing.
+// Only the resource rules: offline, traffic and expiry are the 通知 page's, and
+// two systems announcing one event send it twice. Their keys stay readable (an
+// engine still reads them, and the page offers to clear a value left over from
+// before the split) but this page no longer writes them.
 const ALERT_THRESHOLDS = [
-  { key: "alert_offline_minutes", label: "离线超过", unit: "分钟", placeholder: "5" },
-  { key: "alert_traffic_percent", label: "流量超过套餐的", unit: "%", placeholder: "80" },
-  { key: "alert_expiry_days", label: "到期前", unit: "天", placeholder: "7" },
   { key: "alert_resource_percent", label: "CPU / 内存 / 硬盘超过", unit: "%", placeholder: "90" },
   { key: "alert_resource_minutes", label: "且持续", unit: "分钟", placeholder: "5" },
 ] as const
+
+/** The three rules the 通知 page owns. Any of them still holding a number here
+ * makes this system announce the same event a second time. */
+const LEGACY_KEYS = ["alert_offline_minutes", "alert_traffic_percent", "alert_expiry_days"] as const
+const LEGACY_LABELS: Record<string, string> = {
+  alert_offline_minutes: "离线阈值",
+  alert_traffic_percent: "流量阈值",
+  alert_expiry_days: "到期提醒",
+}
 
 function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) {
   const { s, set, save, reload } = useSettings(refreshMe)
@@ -1775,6 +1796,13 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
   // the placeholder is what an operator should see as the suggested value.
   const value = (key: string) => String(s[key] ?? "")
   const patch = () => Object.fromEntries(ALERT_THRESHOLDS.map(({ key }) => [key, value(key)]))
+
+  // What the split left behind: a number stored for a rule the 通知 page now owns
+  // still drives this engine, so the same outage would be announced by both. Zero
+  // is how this hub switches a rule off, which makes clearing the value the whole
+  // fix -- offered here rather than left for an operator to know to do.
+  const legacy = LEGACY_KEYS.filter((k) => Number(value(k)) > 0)
+  const legacyPatch = () => Object.fromEntries(LEGACY_KEYS.map((k) => [k, "0"]))
 
   // Ids, not names: a node keeps its mute when it is renamed. Stored as the
   // comma-separated list the hub validates, parsed back for the switches.
@@ -1828,13 +1856,23 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
 
   return (
     <div className="space-y-4">
+
+
+      {/* The division of labour with the 通知 page, said here as well because an
+          operator who lands on this page alone would otherwise configure the two
+          systems to announce the same event. */}
+      <div className="rounded-md border border-dashed px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+        这一页是本 fork 的告警，只管 <b>CPU / 内存 / 硬盘持续超阈值</b>（文案固定、不含图标，按状态变化去重），
+        渠道和按节点静音都是这一套自己的。<b>离线与恢复、流量、到期、登录提醒在「通知」页</b>，那一套有自己的
+        渠道、阈值与可编辑模板 —— 两边各发一份只在同一类事件被两处都配时才发生。
+      </div>
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">Telegram 机器人</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
             在 Telegram 里找 <code className="rounded bg-muted px-1">@BotFather</code> 建一个机器人，把整条 token 复制过来；
             再对机器人说句话，然后用 <code className="rounded bg-muted px-1">@userinfobot</code> 查自己的 Chat ID。
-            群组要先把机器人拉进去，Chat ID 是负数。
+            群组要先把机器人拉进去，Chat ID 是负数。这一页的渠道只用于资源占用告警；离线、流量、到期走「通知」页。
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -1923,8 +1961,8 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
         <div>
           <h3 className="text-sm font-medium">触发条件</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            每 30 秒检查一遍，只在状态变化时推送一次，不会每轮重复。填 0 表示关闭该条。
-            节点恢复、流量用尽（100%）、到期当天这些情况不受上面阈值影响，一定会播报。
+            这一页只做<b>资源占用</b>：每 30 秒检查一遍，读数超过阈值并持续够久才推送，且只在状态变化时推一次。
+            填 0 表示关闭该条。离线与恢复、流量、到期、登录提醒由「通知」页负责，那边有自己的阈值和文案模板。
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -1943,6 +1981,17 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
             </Field>
           ))}
         </div>
+        {legacy.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed">
+            <span className="min-w-0 flex-1">
+              这里还留着旧版配置的阈值：{legacy.map((k) => `${LEGACY_LABELS[k]} ${value(k)}`).join("、")}。
+              这几类现在归「通知」页管，但旧值仍会让这一套再发一份 —— 清零即交给它。
+            </span>
+            <Button size="sm" variant="outline" onClick={() => save(legacyPatch())}>
+              清零
+            </Button>
+          </div>
+        )}
         <div>
           <Button size="sm" onClick={() => save(patch())}>
             保存触发条件
@@ -1954,8 +2003,9 @@ function Alerts({ refreshMe, nodes }: { refreshMe: () => void; nodes: Node[] }) 
         <div>
           <h3 className="text-sm font-medium">节点</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            关掉的节点不参与任何告警：离线、流量、到期、CPU / 内存 / 硬盘占用都不会推送。适合临时节点，
-            或者还在调试的机器。重新打开后，当前仍然成立的情况会立刻播报一次，不用等它再发生一遍。
+            关掉的节点不参与<b>这一页</b>的告警：CPU / 内存 / 硬盘占用不会推送，适合临时节点或者还在调试的
+            机器。重新打开后，当前仍然成立的情况会立刻播报一次，不用等它再发生一遍。离线、流量、到期的
+            逐节点开关在节点弹窗里，那一条由「通知」页那套使用。
           </p>
         </div>
         {nodes.length === 0 ? (
@@ -2237,11 +2287,12 @@ function Data() {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
-  // `/admin/notify` is deliberately not offered. This fork's own alerting page owns
-  // notification -- one set of channels, one per-node switch -- and a second surface
-  // with its own token, thresholds and mute announced the same events twice. The
-  // route below and `src/notify.rs` stay: upstream keeps developing them, and a
-  // module deleted here is a conflict at every future merge. Unlisted, still there.
+  // Two notification surfaces, on purpose. Upstream's page owns offline/recovery,
+  // traffic, expiry and login, with editable templates; this fork's 告警 page owns
+  // the resource thresholds it has no rule for. Either is a complete system on its
+  // own, and the overlap is invisible from one page alone, so each header says
+  // what it owns and what happens when both are configured.
+  { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/alerts", label: "告警", icon: BellRing },
   { path: "/admin/themes", label: "主题", icon: Palette },
