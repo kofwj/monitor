@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/monitor-probe/monitor/main/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://raw.githubusercontent.com/kofwj/monitor/main/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -14,7 +14,13 @@ set -eu
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
 
-REPO="monitor-probe/monitor"
+# This fork's releases, not upstream's. Every other step of this script works just
+# as well against upstream, so a copy that names it there installs the wrong hub
+# and reports success while doing it -- which is how it went unnoticed: the run
+# finishes clean, the service starts, and the version is the thing that differs.
+# Kept in the repository rather than patched into a copy by hand, for the same
+# reason. A merge with upstream flags this line; the fork's answer is this one.
+REPO="kofwj/monitor"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
