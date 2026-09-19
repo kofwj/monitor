@@ -50,3 +50,23 @@ lto = true
 opt-level = "z"
 panic = "abort"
 strip = true
+
+# The dev profile used to sit at its defaults, and `target/` grew to 3.2G on one
+# machine: full debug info plus an incremental cache, over a 235-package tree --
+# tokio, axum, reqwest/rustls, and `rusqlite` with `bundled` SQLite. Every edit
+# that changed a crate hash left another pile of `.rcgu.o` files and another
+# incremental session behind, and cargo never reclaims the superseded ones.
+# Neither knob below touches a release build; those still follow the profile
+# above, which is the only one that ships.
+[profile.dev]
+# Keep line tables, so panics and backtraces still name a file and line, but stop
+# writing a debug-info entry per variable.
+debug = "line-tables-only"
+# Drop the incremental cache. This is the half of `target/` that is easiest to
+# forget about -- it measured 1.2G here on its own.
+incremental = false
+
+# Dependency code does not need debug info either: when something breaks, the
+# frames worth reading are in our own `src/`.
+[profile.dev.package."*"]
+debug = false
