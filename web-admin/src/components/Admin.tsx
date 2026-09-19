@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { BellRing, CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { BellRing, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -13,8 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
-import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
-import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
+import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type Source } from "@/lib/api"
+import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
@@ -44,28 +44,95 @@ function copy(text: string) {
   )
 }
 
-// Every address a node has, each click-to-copy: pasting one into an ssh command
-// is why they are shown.
+const SOURCES: Record<Source, string> = {
+  manual: "手动填写",
+  interface: "网卡地址",
+  exit: "hub 看到的出口，不在节点网卡上（NAT 或代理）",
+  connection: "hub 看到的连接地址",
+}
+
+// The address a node is reached by, one per family, each click-to-copy: pasting
+// one into an ssh command is why they are shown. Where each came from is in the
+// tooltip, keeping the column to addresses alone.
 function Addresses({ node }: { node: Node }) {
-  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  // `ip` is merely where the agent's connection originated: the fallback for an
-  // agent too old to report its own interfaces.
-  const list = reported.length ? reported : ([node.ip].filter(Boolean) as string[])
+  const list = addresses(node)
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
-      {list.map((address) => (
+      {list.map(({ address, source }) => (
         <button
           key={address}
           type="button"
           onClick={() => copy(address)}
-          title="点击复制"
+          title={`${SOURCES[source]}。点击复制`}
           className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
         >
           {address}
           <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
         </button>
       ))}
+    </div>
+  )
+}
+
+// Name, address and country: what a node is looked up by, in every node list.
+function searchNodes(nodes: Node[], query: string) {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return nodes
+  return nodes.filter((n) =>
+    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle)))
+}
+
+function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
+  return (
+    <div className={`relative ${className}`}>
+      <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+      <Input className="pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+    </div>
+  )
+}
+
+// Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
+// search narrows what they touch: search JP, then 全选. Offline nodes are dimmed
+// but remain selectable.
+function NodePicker({ nodes, chosen, onPick, disabled = false }: {
+  nodes: Node[]
+  chosen: Set<number>
+  onPick: (list: Node[], on: boolean) => void
+  disabled?: boolean
+}) {
+  const [query, setQuery] = useState("")
+  // The unfiltered list's height, held as its floor: in a centred dialog a
+  // shrinking list would move the search box out from under the cursor.
+  const [listHeight, setListHeight] = useState(0)
+  const visible = searchNodes(nodes, query)
+  const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
+  return (
+    <div className="rounded-lg border">
+      <div className="flex items-center gap-1 border-b p-2">
+        <NodeSearch className="min-w-0 flex-1" value={query} onChange={setQuery} />
+        <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
+        <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
+      </div>
+      {/* Three columns keep a few dozen nodes within one scroll. */}
+      <div
+        ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
+        // Capped like the height itself, which a min-height would otherwise
+        // override once the viewport shrinks.
+        style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
+        className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
+      >
+        {visible.map((n) => (
+          <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+            <input type="checkbox" checked={chosen.has(n.id)} disabled={disabled} onChange={(e) => onPick([n], e.target.checked)} className="shrink-0 accent-primary" />
+            <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
+            {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
+          </label>
+        ))}
+        {!visible.length && (
+          <p className="col-span-full p-2 text-xs text-muted-foreground">{nodes.length ? "没有匹配的节点" : "先添加节点"}</p>
+        )}
+      </div>
     </div>
   )
 }
@@ -167,6 +234,9 @@ function NodeForm({ node, onClose, onSaved }: {
   // edit and zero a node that has transferred a few MB.
   const pristine = useRef(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
+  // What each address box falls back to when left empty.
+  const automatic = (v6: boolean) =>
+    addresses({ ...node, ipv4_pin: "", ipv6_pin: "" }).find((a) => a.address.includes(":") === v6)?.address ?? "无"
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
@@ -177,6 +247,10 @@ function NodeForm({ node, onClose, onSaved }: {
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
+      notify: !!form.notify,
+      ipv4_pin: (form.ipv4_pin ?? "").trim(),
+      ipv6_pin: (form.ipv6_pin ?? "").trim(),
+      country_pin: (form.country_pin ?? "").trim().toUpperCase(),
     })
     const correction = trafficCorrection(pristine.current, traffic)
     if ([patch.traffic_limit, ...Object.values(correction)].some((v) => v !== undefined && (!Number.isSafeInteger(v) || v < 0))) {
@@ -207,62 +281,95 @@ function NodeForm({ node, onClose, onSaved }: {
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-5">
-          <Field label="名称">
-            <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
-          </Field>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月流量额度 (GB)" hint="留空或 0 不限">
-              <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
-            </Field>
-            <Field label="流量计算方式">
-              <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
-                    <SelectItem key={k} value={k}>{v}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月重置日" hint="1–31。本月流量按新周期重算，总流量不变">
-              <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
-            </Field>
-            <Field label="备注" hint="仅管理员可见">
-              <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
-            </Field>
-          </div>
-          <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
-            <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              按 GB 填入需要校正的值，未修改的计数器继续正常累计。
-            </p>
-            <div className="mt-3 grid gap-4 sm:grid-cols-2">
-              {TRAFFIC_FIELDS.map(([key, label]) => (
-                <Field key={key} label={`${label} (GB)`}>
-                  <Input
-                    type="number"
-                    step="0.001"
-                    value={traffic[key]}
-                    onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
-                  />
-                </Field>
-              ))}
+        <div className="space-y-6">
+          <section className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="名称">
+                <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
+              </Field>
+              <Field label="备注">
+                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途，仅管理员可见" />
+              </Field>
             </div>
-          </details>
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">公开显示</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
-            </span>
-            <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
-          </label>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+                <span>
+                  <span className="block font-medium">公开显示</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
+                </span>
+                <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
+              </label>
+              {/* No per-node 离线通知 switch here: it belongs to `/admin/notify`, which
+                  this panel does not offer. The 告警 page's per-node mute is the switch
+                  that means something in this build, and `node.notify` stays in the row
+                  and in the save body for upstream's own feature. */}
+            </div>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="text-sm font-medium">流量</h3>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label="每月额度 (GB)" hint="留空或 0 不限">
+                <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
+              </Field>
+              <Field label="计算方式">
+                <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
+                      <SelectItem key={k} value={k}>{v}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="每月重置日" hint="1–31，改后本月重算，总量不变">
+                <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
+              </Field>
+            </div>
+            <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
+              <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
+              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                按 GB 填入需要校正的值，未修改的计数器继续正常累计。
+              </p>
+              <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                {TRAFFIC_FIELDS.map(([key, label]) => (
+                  <Field key={key} label={`${label} (GB)`}>
+                    <Input
+                      type="number"
+                      step="0.001"
+                      value={traffic[key]}
+                      onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
+                    />
+                  </Field>
+                ))}
+              </div>
+            </details>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="text-sm font-medium">地址与地区</h3>
+            <div className="grid gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
+              <Field label="IPv4">
+                <Input value={form.ipv4_pin ?? ""} onChange={(e) => set("ipv4_pin", e.target.value)} placeholder={`自动：${automatic(false)}`} />
+              </Field>
+              <Field label="IPv6">
+                <Input value={form.ipv6_pin ?? ""} onChange={(e) => set("ipv6_pin", e.target.value)} placeholder={`自动：${automatic(true)}`} />
+              </Field>
+              <Field label="国家/地区">
+                <Input
+                  value={form.country_pin ?? ""}
+                  maxLength={2}
+                  onChange={(e) => set("country_pin", e.target.value.toUpperCase())}
+                  placeholder={`自动：${node.country_auto || "无"}`}
+                />
+              </Field>
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              留空为自动。国家/地区填两位代码，如 CN；手填的值会一直显示，IP 变了要自己改。
+            </p>
+          </section>
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>取消</Button>
@@ -562,6 +669,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
+  const [query, setQuery] = useState("")
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   // Reorder saves after this one, for the same reason the settings writes are
@@ -573,6 +681,10 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
     ...nodes.filter((node) => !orderedIds.has(node.id)),
   ]
+  // `order` itself stays whole, because the order sent on drop is the order of
+  // every node.
+  const visible = searchNodes(order, query)
+  const searching = query.trim() !== ""
 
   async function remove() {
     if (!deleting) return
@@ -628,7 +740,8 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   return (
     <div className="space-y-4">
       {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
-      <div className="flex justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
@@ -655,7 +768,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             </TableRow>
           </TableHeader>
           <TableBody>
-            {order.map((n, index) => (
+            {visible.map((n, index) => (
               <TableRow
                 key={n.id}
                 style={{ viewTransitionName: `node-${n.id}` }}
@@ -669,9 +782,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      draggable
-                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
-                      title="拖动排序"
+                      draggable={!searching}
+                      // A drop sends the order of every node, and a filtered list
+                      // offers only its own rows to drop onto, so the index below
+                      // is the full one exactly while nothing is filtered out.
+                      disabled={searching}
+                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+                      title={searching ? "清空搜索后可拖动排序" : "拖动排序"}
                       aria-label={`拖动 ${n.name} 排序`}
                       onDragStart={(e) => {
                         orderBeforeDrag.current = order.map((node) => node.id)
@@ -694,7 +811,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                     </button>
                     <div className="min-w-0 font-medium">{n.name}</div>
                     {n.country && (
-                      <Badge variant="outline" className="shrink-0 font-normal text-muted-foreground">
+                      <Badge
+                        variant="outline"
+                        title={n.country_pin ? "手动指定" : undefined}
+                        className="shrink-0 font-normal text-muted-foreground"
+                      >
                         {n.country}
                       </Badge>
                     )}
@@ -720,7 +841,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 {/* Counted by the node's own billing rule, as on the public
                     page. */}
                 <TableCell className="tnum text-sm">
-                  {bytes(monthUsage(n))}
+                  {bytes(n.month_used)}
                   <span className="text-muted-foreground">
                     {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
                   </span>
@@ -749,6 +870,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
                   还没有节点，右上角添加
+                </TableCell>
+              </TableRow>
+            )}
+            {searching && nodes.length > 0 && !visible.length && (
+              <TableRow>
+                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                  没有匹配的节点
                 </TableCell>
               </TableRow>
             )}
@@ -796,31 +924,116 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   )
 }
 
-function Ping({ nodes }: { nodes: Node[] }) {
-  const [tasks, setTasks] = useState<PingTask[]>([])
-  const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
-  const [deleting, setDeleting] = useState<PingTask | null>(null)
+function PingForm({ task, nodes, onClose, onSaved }: {
+  task: Partial<PingTask>
+  nodes: Node[]
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [form, setForm] = useState(task)
   const [saving, setSaving] = useState(false)
-  const [removing, setRemoving] = useState(false)
+  // The assignments as the hub holds them, as far as this dialog can tell: those
+  // loaded, plus any node that registers while it is open, which an auto_join
+  // probe takes at once. Shown ticked, so unticking one removes it.
+  const base = useRef(task.nodes ?? [])
+  const seen = useRef(new Set(nodes.map((n) => n.id)))
+  useEffect(() => {
+    const fresh = nodes.filter((n) => !seen.current.has(n.id)).map((n) => n.id)
+    for (const id of fresh) seen.current.add(id)
+    if (!task.auto_join || !fresh.length) return
+    base.current = [...base.current, ...fresh]
+    setForm((f) => ({ ...f, nodes: [...(f.nodes ?? []), ...fresh] }))
+  }, [nodes, task.auto_join])
+  const chosen = new Set(form.nodes)
+  // Counted against the live list: `form.nodes` can still name a node deleted
+  // since the probes were loaded.
+  const chosenCount = nodes.filter((n) => chosen.has(n.id)).length
 
-  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
-  useEffect(() => { load() }, [])
+  const pick = (list: Node[], on: boolean) =>
+    setForm((f) => {
+      const next = new Set(f.nodes)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return { ...f, nodes: [...next] }
+    })
 
   async function save() {
-    if (!editing) return
-    if (!editing.name?.trim() || !editing.target?.trim()) return toast.error("请填写名称和目标")
+    if (!form.name?.trim() || !form.target?.trim()) return toast.error("请填写名称和目标")
     setSaving(true)
     try {
-      await api("/ping-tasks", { method: "POST", body: JSON.stringify(editing) })
+      // `base` limits the save to what was ticked or unticked here; a node that
+      // joined through auto_join while the dialog was open keeps its assignment.
+      await api("/ping-tasks", { method: "POST", body: JSON.stringify(task.id ? { ...form, base: base.current } : form) })
       toast.success("已保存，正在下发")
-      setEditing(null)
-      load()
+      onClose()
+      onSaved()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       setSaving(false)
     }
   }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{task.id ? "编辑监控" : "添加监控"}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-6">
+          {/* On a phone the name takes the first row and the target shares the
+              second with the interval, so the tab order matches the screen. */}
+          <section className="grid grid-cols-[1fr_6rem] gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
+            <Field label="名称" className="col-span-full sm:col-span-1">
+              {/* A new monitor starts empty, so the cursor belongs here;
+                  editing an existing one starts with nothing selected. */}
+              <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
+            </Field>
+            <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
+              <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
+            </Field>
+            <Field label="间隔（秒）" hint="5–3600">
+              {/* An emptied number box reads back as "", and Number("") is 0,
+                  which the hub refuses. */}
+              <Input type="number" min="5" max="3600" value={form.interval ?? 60} onChange={(e) => setForm({ ...form, interval: Number(e.target.value) || 60 })} />
+            </Field>
+          </section>
+          <section className="space-y-3 border-t pt-5">
+            <div className="flex items-baseline justify-between gap-2">
+              <h3 className="text-sm font-medium">运行节点</h3>
+              <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
+            </div>
+            <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
+            <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
+              <span>
+                <span className="block font-medium">新节点自动加入</span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">以后添加的节点自动运行此监控</span>
+              </span>
+              <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
+            </label>
+          </section>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={save} disabled={saving}>保存</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function Ping({ nodes }: { nodes: Node[] }) {
+  const [tasks, setTasks] = useState<PingTask[]>([])
+  const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
+  const [deleting, setDeleting] = useState<PingTask | null>(null)
+  const [removing, setRemoving] = useState(false)
+
+  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
+  // A node added or removed changes assignments on the hub: auto_join adds, a
+  // deletion cascades.
+  useEffect(() => { load() }, [nodes.length])
 
   async function remove() {
     if (!deleting) return
@@ -837,17 +1050,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
     }
   }
 
-  const toggle = (id: number) =>
-    setEditing((t) => {
-      if (!t) return t
-      const nodes = t.nodes ?? []
-      return { ...t, nodes: nodes.includes(id) ? nodes.filter((n) => n !== id) : [...nodes, id] }
-    })
-
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
-        <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: [] })}>
+        <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: nodes.map((n) => n.id), auto_join: true })}>
           <Plus /> 添加监控
         </Button>
       </div>
@@ -856,10 +1062,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-[24%]">名称</TableHead>
-              <TableHead className="w-[40%]">目标</TableHead>
-              <TableHead className="w-[12%]">间隔</TableHead>
-              <TableHead className="w-[12%]">节点</TableHead>
+              <TableHead className="w-[22%]">名称</TableHead>
+              <TableHead className="w-[34%]">目标</TableHead>
+              <TableHead className="w-[10%]">间隔</TableHead>
+              <TableHead className="w-[22%]">节点</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -869,7 +1075,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <TableCell className="font-medium">{t.name}</TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
-                <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 个</TableCell>
+                <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
+                  {t.nodes.length > 0 && t.nodes.length === nodes.length ? "全部" : `${t.nodes.length} 个`}
+                  {t.auto_join && <Badge variant="outline" className="ml-2 font-normal">自动加入</Badge>}
+                </TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" onClick={() => setEditing(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
@@ -889,51 +1098,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
         </Table>
       </Card>
 
-      {editing && (
-        <Dialog open onOpenChange={(open) => !open && setEditing(null)}>
-          <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
-            <DialogHeader>
-              <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-5">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="名称">
-                  {/* A new monitor starts empty, so the cursor belongs here;
-                      editing an existing one starts with nothing selected. */}
-                  <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
-                </Field>
-                <Field label="间隔（秒）" hint="5–3600">
-                  {/* `|| 60`, as the three other number boxes on this page do:
-                      an emptied `type="number"` reads back as "", and Number("")
-                      is 0 -- which the hub used to clamp into a 5-second probe on
-                      every assigned node. It refuses that now, so this keeps a
-                      cleared box from being a round trip to an error. */}
-                  <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) || 60 })} />
-                </Field>
-              </div>
-              <Field label="目标地址" hint="host:port">
-                <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
-              </Field>
-              <div className="space-y-2">
-                <Label className="text-sm font-medium">运行节点</Label>
-                <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
-                  {nodes.map((n) => (
-                    <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-background">
-                      <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="accent-primary" />
-                      {n.name}
-                    </label>
-                  ))}
-                  {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
-                </div>
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" onClick={() => setEditing(null)}>取消</Button>
-              <Button onClick={save} disabled={saving}>保存</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      )}
+      {editing && <PingForm task={editing} nodes={nodes} onClose={() => setEditing(null)} onSaved={load} />}
       {deleting && (
         <ConfirmDialog
           title={`删除监控「${deleting.name}」？`}
@@ -1196,6 +1361,16 @@ function useSettings(onSaved?: () => void) {
       const run = updates.current.then(async () => {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
         toast.success("已保存")
+        // Only the saved keys and the `*_set` flags are taken from the hub: a
+        // credential comes back as a flag, so the typed value must not linger,
+        // while another card's unsaved edits on the same page must survive.
+        const fresh = await api<Settings>("/settings")
+        setS((old) => {
+          const next = { ...old }
+          for (const key of Object.keys(patch)) next[key] = fresh[key]
+          for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
+          return next
+        })
         onSaved?.()
       })
       updates.current = run.catch(() => {})
@@ -1263,6 +1438,261 @@ function SettingsTab({ refreshMe }: { refreshMe: () => void }) {
             }
           >
             保存站点设置
+          </Button>
+        </div>
+      </Card>
+    </div>
+  )
+}
+
+const TEXTAREA =
+  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+
+// One offline alert, filled in the way the hub fills a template: in a single pass,
+// JSON-escaped for the webhook body. Previews only; nothing here is sent.
+const SAMPLE_NOTE: Record<string, string> = {
+  event: "offline",
+  node: "香港 · 甲商家",
+  title: "🔴 香港 · 甲商家 离线",
+  message: "最后上报 09-15 20:13 +08:00",
+  time: "09-15 20:16 +08:00",
+}
+
+const PLACEHOLDERS = "{{title}} {{message}} {{node}} {{event}} {{site}} {{time}}"
+
+function TemplatePreview({ template, site, json = false }: { template: string; site: string; json?: boolean }) {
+  if (!template.trim()) return <p className="text-xs text-muted-foreground">留空保存即恢复默认模板</p>
+  const values = { ...SAMPLE_NOTE, site }
+  let out = template.replace(/\{\{(event|node|title|message|site|time)\}\}/g, (_, key: keyof typeof values) =>
+    json ? JSON.stringify(values[key]).slice(1, -1) : values[key],
+  )
+  if (json) {
+    try {
+      out = JSON.stringify(JSON.parse(out), null, 2)
+    } catch {
+      return (
+        <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": "{"{{title}}"}"
+        </p>
+      )
+    }
+  }
+  return (
+    <div className="space-y-1">
+      <div className="text-xs text-muted-foreground">预览（以一条离线通知为例）</div>
+      <pre className="overflow-x-auto rounded-md bg-muted/50 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-all">{out}</pre>
+    </div>
+  )
+}
+
+// A channel's form, collapsed until needed. The summary carries whether the
+// channel is configured, so the closed card still answers the common question.
+function ChannelCard({ title, configured, children }: { title: string; configured: boolean; children: React.ReactNode }) {
+  return (
+    <Card className="p-5">
+      <details className="group">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+          <span className="flex items-center gap-2 text-sm font-medium">
+            <ChevronRight className="size-4 text-muted-foreground transition-transform group-open:rotate-90" />
+            {title}
+          </span>
+          <Badge variant={configured ? "secondary" : "outline"}>{configured ? "已配置" : "未配置"}</Badge>
+        </summary>
+        <div className="mt-4 space-y-4">{children}</div>
+      </details>
+    </Card>
+  )
+}
+
+// Offline alerts are opt-in per node, so turning them on for a fleet needs one
+// place rather than one dialog per node.
+function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
+  const [busy, setBusy] = useState(false)
+
+  async function apply(targets: Node[], on: boolean) {
+    setBusy(true)
+    try {
+      // Awaited in turn, the requests would cost one round trip per node, and
+      // the two-second stream would render each one as it lands.
+      await Promise.all(
+        targets
+          .filter((n) => !!n.notify !== on)
+          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
+      )
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      refresh()
+      setBusy(false)
+    }
+  }
+
+  const enabled = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
+  return (
+    <Card className="gap-4 p-5">
+      <div>
+        <h3 className="text-sm font-medium">离线通知</h3>
+        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
+      </div>
+      <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
+    </Card>
+  )
+}
+
+function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
+  const { s, set, save } = useSettings()
+  const [testing, setTesting] = useState(false)
+  if (!s) return null
+  const text = (k: string) => String(s[k] ?? "")
+  // A credential is sent only when something was typed: the field starts empty
+  // because the hub never returns the stored value.
+  const typed = (...keys: string[]) =>
+    Object.fromEntries(keys.filter((k) => typeof s[k] === "string" && s[k] !== "").map((k) => [k, text(k)]))
+  const secretHint = (k: string) => (s[`${k}_set`] ? "已设置，留空不变" : "未设置")
+
+  async function test() {
+    setTesting(true)
+    try {
+      const { sent } = await api<{ sent: string[] }>("/notify/test", { method: "POST" })
+      toast.success(`测试通知已发送：${sent.join("、")}`)
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-medium">通知渠道</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
+            </p>
+          </div>
+          <Button size="sm" variant="secondary" disabled={testing} onClick={test}>
+            <Send /> {testing ? "发送中…" : "发送测试"}
+          </Button>
+        </div>
+      </Card>
+
+      <ChannelCard title="Telegram" configured={!!s.notify_telegram_token_set && text("notify_telegram_chat") !== ""}>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Bot Token" hint={secretHint("notify_telegram_token")}>
+            <Input
+              type="password"
+              autoComplete="off"
+              placeholder={s.notify_telegram_token_set ? "••••••••" : "123456:ABC-DEF…"}
+              value={text("notify_telegram_token")}
+              onChange={(e) => set("notify_telegram_token", e.target.value)}
+            />
+          </Field>
+          <Field label="Chat ID" hint="数字 ID，群组是负数；公开频道可填 @频道名">
+            <Input value={text("notify_telegram_chat")} onChange={(e) => set("notify_telegram_chat", e.target.value)} placeholder="-1001234567890" />
+          </Field>
+        </div>
+        <Field label="消息模板" hint={`纯文本。占位符 ${PLACEHOLDERS}`}>
+          <textarea rows={3} className={TEXTAREA} value={text("notify_telegram_text")} onChange={(e) => set("notify_telegram_text", e.target.value)} />
+        </Field>
+        <TemplatePreview template={text("notify_telegram_text")} site={text("site_name") || "Monitor"} />
+        <div className="flex gap-2">
+          <Button
+            size="sm"
+            onClick={() =>
+              save({
+                notify_telegram_chat: text("notify_telegram_chat"),
+                notify_telegram_text: text("notify_telegram_text"),
+                ...typed("notify_telegram_token"),
+              })
+            }
+          >
+            保存 Telegram
+          </Button>
+          {s.notify_telegram_token_set && (
+            <Button size="sm" variant="ghost" onClick={() => save({ notify_telegram_token: "", notify_telegram_chat: "" })}>
+              清除
+            </Button>
+          )}
+        </div>
+      </ChannelCard>
+
+      <ChannelCard title="Webhook" configured={!!s.notify_webhook_url_set}>
+        <Field label="URL" hint={secretHint("notify_webhook_url")}>
+          <Input
+            type="password"
+            autoComplete="off"
+            placeholder={s.notify_webhook_url_set ? "••••••••" : "https://…"}
+            value={text("notify_webhook_url")}
+            onChange={(e) => set("notify_webhook_url", e.target.value)}
+          />
+        </Field>
+        <Field label="请求头" hint={`可选，一行一个。${s.notify_webhook_headers_set ? "已设置，留空不变" : ""}`}>
+          <textarea
+            rows={2}
+            className={TEXTAREA}
+            placeholder={s.notify_webhook_headers_set ? "••••••••" : "Authorization: Bearer xxx"}
+            value={text("notify_webhook_headers")}
+            onChange={(e) => set("notify_webhook_headers", e.target.value)}
+          />
+        </Field>
+        <Field label="请求体" hint={`以 POST 发送，Content-Type 为 application/json。占位符 ${PLACEHOLDERS}，须写在引号内`}>
+          <textarea rows={4} className={TEXTAREA} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
+        </Field>
+        <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
+        <div className="flex gap-2">
+          <Button
+            size="sm"
+            onClick={() => save({ notify_webhook_body: text("notify_webhook_body"), ...typed("notify_webhook_url", "notify_webhook_headers") })}
+          >
+            保存 Webhook
+          </Button>
+          {s.notify_webhook_headers_set && (
+            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_headers: "" })}>
+              清除请求头
+            </Button>
+          )}
+          {s.notify_webhook_url_set && (
+            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_url: "", notify_webhook_headers: "" })}>
+              清除
+            </Button>
+          )}
+        </div>
+      </ChannelCard>
+
+      <OfflineNodes nodes={nodes} refresh={refresh} />
+
+      <Card className="gap-4 p-5">
+        <h3 className="text-sm font-medium">事件</h3>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
+            <Input type="number" min={1} max={30}value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
+          </Field>
+          <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
+            <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
+          </Field>
+          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，自动续期时也提醒，0 关闭">
+            <Input type="number" min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
+          </Field>
+        </div>
+        <div className="flex items-center gap-2 text-sm">
+          <Switch aria-labelledby="notify-login-label" checked={s.notify_login !== "off"} onCheckedChange={(v) => set("notify_login", v ? "on" : "off")} />
+          <span id="notify-login-label">登录后台时提醒</span>
+        </div>
+        <div>
+          <Button
+            size="sm"
+            onClick={() =>
+              save({
+                notify_grace: text("notify_grace"),
+                notify_traffic: text("notify_traffic"),
+                notify_expiry: text("notify_expiry"),
+                notify_login: s.notify_login === "off" ? "off" : "on",
+              })
+            }
+          >
+            保存事件设置
           </Button>
         </div>
       </Card>
@@ -1807,6 +2237,11 @@ function Data() {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
+  // `/admin/notify` is deliberately not offered. This fork's own alerting page owns
+  // notification -- one set of channels, one per-node switch -- and a second surface
+  // with its own token, thresholds and mute announced the same events twice. The
+  // route below and `src/notify.rs` stay: upstream keeps developing them, and a
+  // module deleted here is a conflict at every future merge. Unlisted, still there.
   { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/alerts", label: "告警", icon: BellRing },
   { path: "/admin/themes", label: "主题", icon: Palette },
@@ -1855,6 +2290,8 @@ export function Admin({
       <div className="min-w-0 flex-1">
         {path === "/admin/ping" ? (
           <Ping nodes={nodes} />
+        ) : path === "/admin/notify" ? (
+          <Notify nodes={nodes} refresh={refresh} />
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/alerts" ? (

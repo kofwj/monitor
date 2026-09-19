@@ -156,6 +156,25 @@ pub fn muted_ok(value: &str) -> bool {
     value.is_empty() || value.split(',').all(|part| part.trim().parse::<i64>().is_ok_and(|id| id > 0))
 }
 
+/// Drops one node from that list, which is what deleting a node has to do.
+///
+/// Ids are what is stored, and SQLite hands a deleted node's id to the next one
+/// created: an entry left behind therefore mutes a machine nobody muted, and
+/// quietly, because the pass never looks at a muted node. Nothing in the list
+/// itself can tell the two apart -- the id is the same id -- so the deletion is
+/// where it has to be removed. `Rules::read` also drops an id that names no node
+/// at all, which is the state a list left by an older build is in until some node
+/// takes the id.
+pub fn unmute(app: &App, id: i64) -> Result<()> {
+    let muted = app.db.get("alert_muted_nodes").unwrap_or_default();
+    let ids: Vec<i64> = muted.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+    if !ids.contains(&id) {
+        return Ok(());
+    }
+    let kept: Vec<String> = ids.iter().filter(|muted| **muted != id).map(i64::to_string).collect();
+    app.db.set("alert_muted_nodes", &kept.join(","))
+}
+
 // ---- the rules ----
 
 /// The rules as the last pass read them.
@@ -426,16 +445,15 @@ impl Pass<'_> {
     }
 }
 
-/// Usage counted as the plan bills it, matching `monthUsage` in the panel: a node
-/// billed on upload alone measured as the sum of both directions would be compared
-/// against the wrong figure.
+/// Usage counted as the plan bills it: a node billed on upload alone measured as
+/// the sum of both directions would be compared against the wrong figure.
+///
+/// The rule itself is `db::Traffic::month_used`, which the panel and this hub's
+/// `notify` read as well, and it moved there when the hub took the figure over
+/// from the panel: this used to be a second copy kept in step with the panel's
+/// own `monthUsage`, which no longer exists.
 fn usage(node: &Node, traffic: &Traffic) -> i64 {
-    match node.traffic_mode.as_str() {
-        "up" => traffic.month_tx,
-        "down" => traffic.month_rx,
-        "max" => traffic.month_rx.max(traffic.month_tx),
-        _ => traffic.month_rx.saturating_add(traffic.month_tx),
-    }
+    traffic.month_used(&node.traffic_mode)
 }
 
 /// One reading as a percentage of its capacity.
@@ -587,6 +605,18 @@ async fn once(app: &App, api: &str, rules: &Rules, uptime: Duration) -> Result<(
     };
 
     let nodes = app.db.nodes()?;
+    // An id in the list that names no node is dropped here. Deleting a node already
+    // takes it out of the list, so what reaches this is a list an older build left
+    // behind -- and clearing it is what keeps a stale entry from muting whatever
+    // takes that id next. Nothing is written unless something is dangling.
+    let live: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+    let kept: HashSet<i64> = rules.muted.iter().copied().filter(|id| live.contains(id)).collect();
+    if kept.len() != rules.muted.len() {
+        let mut ids: Vec<i64> = kept.iter().copied().collect();
+        ids.sort_unstable();
+        let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+        app.db.set("alert_muted_nodes", &list.join(","))?;
+    }
     let traffic = app.db.all_traffic();
     // Every node, every rule, one pass over the map of connected agents. A muted
     // node is dropped here rather than left to `judge`, because "not judged" and
@@ -598,7 +628,7 @@ async fn once(app: &App, api: &str, rules: &Rules, uptime: Duration) -> Result<(
         let none = Traffic::default();
         nodes
             .iter()
-            .filter(|node| !rules.muted.contains(&node.id))
+            .filter(|node| !kept.contains(&node.id))
             .flat_map(|node| pass.judge(node, agents.get(&node.id), traffic.get(&node.id).unwrap_or(&none)))
             .collect()
     };
@@ -1984,6 +2014,51 @@ mod tests {
         assert!(text.contains("db · 已离线"), "{text}");
 
         assert!(!text.contains("web"), "{text}");
+    }
+
+    /// Deleting a muted node takes it out of the list, and the id it held comes back
+    /// with the next node created: an entry left behind would silence a machine
+    /// nobody muted, and do it silently, because the pass never looks at a muted
+    /// node. `unmute` is what a deletion calls -- `api::delete_node` -- and the list
+    /// holds ids, so nothing in it could tell the two nodes apart afterwards.
+    #[tokio::test]
+    async fn deleting_a_muted_node_unmutes_the_next_one_to_take_its_id() {
+        let (api, seen) = mock_telegram(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (app, gone) = wired();
+        app.db.set("alert_muted_nodes", &gone.to_string()).unwrap();
+        assert!(app.db.delete_node(gone).unwrap());
+        unmute(&app, gone).unwrap();
+        assert_eq!(app.db.get("alert_muted_nodes").as_deref(), Some(""));
+
+        // The id comes back with the next node, which is what made the entry
+        // dangerous rather than merely stale.
+        let reborn = app.db.create_node(&node("reborn"), "reborn-token").unwrap();
+        assert_eq!(reborn, gone, "SQLite hands a deleted node's id to the next one");
+        app.db.touch_seen(reborn, Utc::now().timestamp() - 600).unwrap();
+
+        let rules = Rules::read(&app);
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the node that took the id is announced");
+        assert_eq!(sent[0]["text"].as_str().unwrap(), "<b>离线</b>\n· reborn · 已离线 10 分钟\n");
+    }
+
+    /// An id in the list that no node holds is dropped by the next pass. A list an
+    /// older build left behind is where one comes from -- it had no `unmute` -- and
+    /// clearing it now is what keeps it from muting whatever takes that id later.
+    #[tokio::test]
+    async fn an_id_the_list_holds_that_no_node_does_is_dropped_by_the_pass() {
+        let (api, _) = mock_telegram(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (app, live) = wired();
+        app.db.set("alert_muted_nodes", &format!("{live},41")).unwrap();
+
+        let rules = Rules::read(&app);
+        once(&app, &api, &rules, Duration::from_secs(3_600)).await.unwrap();
+        assert_eq!(
+            app.db.get("alert_muted_nodes").unwrap_or_default(),
+            live.to_string(),
+            "the id that names a node is kept, the one that names none is dropped"
+        );
     }
 
     /// A refusal from Telegram leaves the alert owed rather than dropped, and
