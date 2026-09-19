@@ -10,3 +10,6 @@
 /docs/
 /CLAUDE.md
 /.claude/
+
+# macOS 在每个访问过的目录里都会写这个文件
+.DS_Store
