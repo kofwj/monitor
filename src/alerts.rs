@@ -399,9 +399,16 @@ impl Pass<'_> {
         if percent < rules.resource_percent as f64 {
             return Some(Finding::quiet(kind));
         }
+        // `over` as well as `high`, because the state a pass writes is the one it
+        // returns: once the escalation below has been announced, the row reads
+        // `over`. Recognising only `high` fell back to it on the next pass, which
+        // restarted the wait and announced the same overload again every
+        // `resource_minutes` for as long as the machine stayed hot -- and rewrote
+        // the row's `notified`, discarding a message that had not got away.
         let held = rules.resource_minutes <= 0
             || self.stored(node.id, kind).is_some_and(|s| {
-                s.state == "high" && self.now.saturating_sub(s.since) >= rules.resource_minutes * 60
+                s.state == "over"
+                    || (s.state == "high" && self.now.saturating_sub(s.since) >= rules.resource_minutes * 60)
             });
         if !held {
             return Some(Finding { state: "high", line: String::new(), ..Finding::quiet(kind) });
@@ -1466,6 +1473,97 @@ mod tests {
         let immediate = pass(&now_rules, &empty, now).resource(&node("web"), Some(&hot), "cpu").unwrap();
         assert_eq!(immediate.state, "over");
         assert_eq!(immediate.line, "CPU 99%");
+    }
+
+    /// An overload that keeps holding stays `over` rather than falling back to
+    /// `high` and restarting its wait.
+    ///
+    /// The failure this pins: the state a pass writes is the one it returns, so the
+    /// pass after an announced escalation finds `over` on the row. Reading only
+    /// `high` as already held, it returned `high` again, reset `since`, and five
+    /// minutes later announced the same overload a second time -- and never
+    /// stopped, for as long as the machine stayed hot.
+    #[test]
+    fn an_overload_that_keeps_holding_is_not_announced_again() {
+        let (app, id) = hub();
+        let rules = rules();
+        let now = 1_700_000_000;
+        let hot = json!({"cpu": 99.0});
+        // Keyed by the id this hub minted, not the helper's constant.
+        let node = Node { id, ..node("web") };
+        let row = |state: &str, since: i64| {
+            let mut states = HashMap::new();
+            states.insert((id, "cpu".to_owned()), AlertState { state: state.into(), since, notified: 0 });
+            states
+        };
+
+        // The escalation, which is news. `record` writes the state it was handed,
+        // so the row reads `over` from here on.
+        let held = row("high", now - 300);
+        let over = pass(&rules, &held, now).resource(&node, Some(&hot), "cpu").unwrap();
+        assert_eq!(over.state, "over");
+        assert_eq!(record(&app, &held, vec![over.named(&node)], now).unwrap().len(), 1);
+        // Told, which is what `deliver` does once the message is away.
+        app.db.alert_notified(id, "cpu", now).unwrap();
+
+        let states = app.db.alert_states().unwrap();
+        assert_eq!(states[&(id, "cpu".to_owned())].state, "over");
+        assert_eq!(states[&(id, "cpu".to_owned())].since, now, "the escalation starts the state");
+
+        // Still hot half a minute later: the same state, and nothing owed.
+        let again = pass(&rules, &states, now + 30).resource(&node, Some(&hot), "cpu").unwrap();
+        assert_eq!(again.state, "over", "an announced overload does not fall back to high");
+        assert!(
+            record(&app, &states, vec![again.named(&node)], now + 30).unwrap().is_empty(),
+            "and is not news again thirty seconds later"
+        );
+
+        let states = app.db.alert_states().unwrap();
+        assert_eq!(states[&(id, "cpu".to_owned())].since, now, "the wait is not restarted");
+
+        // Nor five minutes in, which is where the fallback sent its second copy of
+        // the same sentence.
+        let later = pass(&rules, &states, now + 300).resource(&node, Some(&hot), "cpu").unwrap();
+        assert_eq!(later.state, "over");
+        assert!(
+            record(&app, &states, vec![later.named(&node)], now + 300).unwrap().is_empty(),
+            "no repeat at the moment a fresh wait would have elapsed"
+        );
+    }
+
+    /// An escalation that never got away is still owed on the next pass.
+    ///
+    /// The row keeps `over`, so the pass that follows reads the same state and the
+    /// `notified == 0` that means undelivered, and retries. Falling back to `high`
+    /// instead rewrote `notified` with the current time, dropping the message with
+    /// no trace anywhere.
+    #[test]
+    fn an_escalation_that_never_went_out_is_still_owed() {
+        let (app, id) = hub();
+        let rules = rules();
+        let now = 1_700_000_000;
+        let hot = json!({"cpu": 99.0});
+        let node = Node { id, ..node("web") };
+        let mut held = HashMap::new();
+        held.insert(
+            (id, "cpu".to_owned()),
+            AlertState { state: "high".into(), since: now - 300, notified: 0 },
+        );
+
+        let over = pass(&rules, &held, now).resource(&node, Some(&hot), "cpu").unwrap();
+        assert_eq!(record(&app, &held, vec![over.named(&node)], now).unwrap().len(), 1);
+
+        // `deliver` never ran, so the row still says this is owed.
+        let states = app.db.alert_states().unwrap();
+        assert_eq!(states[&(id, "cpu".to_owned())].notified, 0, "recorded, not told");
+
+        let again = pass(&rules, &states, now + 30).resource(&node, Some(&hot), "cpu").unwrap();
+        assert_eq!(again.state, "over");
+        assert_eq!(
+            record(&app, &states, vec![again.named(&node)], now + 30).unwrap().len(),
+            1,
+            "an undelivered escalation is owed again rather than written off"
+        );
     }
 
     /// The whole reason for the table: a condition that is still true on the next
