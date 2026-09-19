@@ -14,9 +14,19 @@ fn main() {
     println!("cargo:rerun-if-changed=target/theme/.pin");
     println!("cargo:rerun-if-changed=scripts/theme.sh");
 
+    // Exits rather than panics: a panicking build script prints Rust's own
+    // formatting, which reads like a bug in the hub, while this failure belongs
+    // to the download that `scripts/theme.sh` performs. The exit status stays in
+    // the message because it is the part the script's own output may not state.
     match Command::new("sh").arg("scripts/theme.sh").status() {
         Ok(status) if status.success() => {}
-        Ok(status) => panic!("scripts/theme.sh failed ({status}); see the message above"),
-        Err(e) => panic!("could not run scripts/theme.sh: {e}"),
+        Ok(status) => {
+            eprintln!("scripts/theme.sh failed ({status}); see the message above");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("could not run scripts/theme.sh: {e}");
+            std::process::exit(1);
+        }
     }
 }

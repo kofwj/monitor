@@ -195,7 +195,19 @@ fn manifest(root: &Path, short: &str) -> Option<Theme> {
     let theme: Theme = serde_json::from_slice(&data)
         .inspect_err(|e| tracing::warn!("{short}/theme.json 不是有效的 manifest，主题不会出现在列表里：{e}"))
         .ok()?;
-    (theme.short == short).then_some(theme)
+    if theme.short != short {
+        // The panel and the stored setting both key a theme by `short`, so an
+        // entry whose manifest names something else would offer a name that
+        // resolves to nothing -- what `publish` refuses at install time. On
+        // disk it can only have arrived by hand, and dropping it silently
+        // leaves that operator with no clue why the card never appears.
+        tracing::warn!(
+            "主题目录 {short} 的 theme.json 声明的 short 是 {:?}，与目录名不一致，主题不会出现在列表里",
+            theme.short
+        );
+        return None;
+    }
+    Some(theme)
 }
 
 pub fn themes(app: &App) -> std::io::Result<Vec<Theme>> {
@@ -207,24 +219,33 @@ pub fn themes(app: &App) -> std::io::Result<Vec<Theme>> {
     let mut list = vec![built_in];
 
     if let Ok(base) = app.themes.canonicalize() {
-        for entry in fs::read_dir(&base)? {
-            let Ok(entry) = entry else { continue };
-            let Ok(kind) = entry.file_type() else { continue };
-            let Some(short) = entry.file_name().to_str().map(str::to_owned) else { continue };
-            if !kind.is_dir() || !valid_short(&short) || external_theme(&base, &short).is_none() {
-                continue;
-            }
-            let Ok(root) = entry.path().canonicalize() else { continue };
-            if let Some(theme) = manifest(&root, &short) {
-                // An installed copy of the built-in theme replaces it in the
-                // list rather than appearing beside it, matching `serve`, which
-                // reads the directory before the binary.
-                if theme.short == "default" {
-                    list[0] = theme;
-                } else {
-                    list.push(theme);
+        match fs::read_dir(&base) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(entry) = entry else { continue };
+                    let Ok(kind) = entry.file_type() else { continue };
+                    let Some(short) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                    if !kind.is_dir() || !valid_short(&short) || external_theme(&base, &short).is_none() {
+                        continue;
+                    }
+                    let Ok(root) = entry.path().canonicalize() else { continue };
+                    if let Some(theme) = manifest(&root, &short) {
+                        // An installed copy of the built-in theme replaces it in the
+                        // list rather than appearing beside it, matching `serve`, which
+                        // reads the directory before the binary.
+                        if theme.short == "default" {
+                            list[0] = theme;
+                        } else {
+                            list.push(theme);
+                        }
+                    }
                 }
             }
+            // The embedded theme needs no directory, so a failure here costs the
+            // panel the installed themes rather than the whole list -- and
+            // `selectable` cannot tell an error from an empty list, which would
+            // leave the settings page offering nothing to switch to.
+            Err(e) => tracing::warn!("读不了主题目录 {}，主题列表里只剩内置主题：{e}", base.display()),
         }
     }
 
@@ -254,6 +275,36 @@ const MAX_ENTRIES: usize = 2_000;
 const MAX_FILE: u64 = 8 << 20;
 const MAX_EXPANDED: u64 = 64 << 20;
 
+/// Prefixes of the temporary directories installs create under `<themes>`, each
+/// finished with random characters. `valid_short` rejects the leading dot, which
+/// is what keeps a theme that is still being unpacked out of `themes()` and
+/// `serve` -- and also what keeps anyone else from ever looking at them.
+const STAGING_PREFIX: &str = ".staging-";
+const REPLACED_PREFIX: &str = ".replaced-";
+
+/// Deletes what earlier installs left behind: a `.staging-*` from an unpack that
+/// never finished, a `.replaced-*` from a theme that was renamed aside and then
+/// never removed. Both are invisible to `themes()` and `serve` by design, so
+/// nothing reclaims the disk they hold -- a hub restarted after a kill would
+/// keep those bytes for as long as it runs. Failing to clean up is no reason to
+/// refuse an install, so every error here is a warning rather than a bail.
+fn discard_leftovers(themes: &Path) {
+    let Ok(entries) = fs::read_dir(themes) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(STAGING_PREFIX) && !name.starts_with(REPLACED_PREFIX) {
+            continue;
+        }
+        // Directories both, but `remove_dir_all` refuses any other kind, and a
+        // stray file carrying the prefix would otherwise keep its bytes: the
+        // fallback costs nothing next to the alternative.
+        if fs::remove_dir_all(entry.path()).or_else(|_| fs::remove_file(entry.path())).is_err() {
+            tracing::warn!("{} 删不掉，占用的空间不会释放", entry.path().display());
+        }
+    }
+}
+
 /// Installs a theme from its published `theme.tar.gz`, under the name its own
 /// manifest carries.
 ///
@@ -264,10 +315,16 @@ const MAX_EXPANDED: u64 = 64 << 20;
 /// from an incomplete directory. A theme being replaced is renamed aside rather
 /// than deleted, and restored if the publish cannot complete.
 ///
+/// A process killed between the unpack and the publish leaves its staging
+/// directory, and one killed between renaming the old theme aside and removing
+/// it leaves a `.replaced-*`: both are swept before this install starts,
+/// because nothing else will ever look at them again.
+///
 /// `expect` names the short the caller is replacing, where one is specified: an
 /// upload installs whatever it carries, an update may not.
 pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Result<Theme> {
-    let staging = themes.join(format!(".staging-{}", &random_token()[..16]));
+    discard_leftovers(themes);
+    let staging = themes.join(format!("{STAGING_PREFIX}{}", &random_token()[..16]));
     let installed = unpack(archive, &staging).and_then(|()| publish(themes, &staging, expect));
     if installed.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -334,7 +391,7 @@ fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme>
     }
 
     let destination = themes.join(&theme.short);
-    let replaced = themes.join(format!(".replaced-{}", &random_token()[..16]));
+    let replaced = themes.join(format!("{REPLACED_PREFIX}{}", &random_token()[..16]));
     let replacing = destination.exists();
     if replacing {
         fs::rename(&destination, &replaced)?;
@@ -369,8 +426,12 @@ pub fn preview(themes: &Path, short: &str) -> Option<Vec<u8>> {
         return None;
     }
     let root = themes.join(short);
-    if let Ok(meta) = fs::metadata(root.join(PREVIEW)) {
-        return (meta.len() <= MAX_FILE).then(|| read_inside(&root, PREVIEW)).flatten();
+    // A thumbnail over the limit is no thumbnail at all: the check is there so
+    // that nothing that large is served, and stopping on it would equally deny
+    // the built-in theme the embedded copy this function falls back to -- which
+    // is the case that branch is for.
+    if fs::metadata(root.join(PREVIEW)).is_ok_and(|meta| meta.len() <= MAX_FILE) {
+        return read_inside(&root, PREVIEW);
     }
     // No directory, or one carrying no thumbnail of its own: the built-in theme
     // has its own embedded beside the assets it serves.
@@ -389,7 +450,13 @@ pub fn remove(themes: &Path, short: &str) -> Result<()> {
         bail!("没有这个主题");
     }
     let base = themes.canonicalize()?;
-    let root = base.join(short).canonicalize()?;
+    // A name with no directory behind it fails to canonicalize, and the only
+    // other way out of the guard below is a symlink leaving `<themes>`. The two
+    // answer alike so that a caller cannot tell a theme that is not installed
+    // from one it may not delete: this message is all an operator gets to see.
+    let Ok(root) = base.join(short).canonicalize() else {
+        bail!("没有这个主题");
+    };
     // Canonical on both sides: a symlink leading out of the themes directory
     // must not be deleted through.
     if !root.starts_with(&base) || !root.is_dir() {
@@ -615,5 +682,163 @@ mod tests {
         let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
         assert!(selectable(&app, "") && selectable(&app, "default"));
         assert!(!selectable(&app, "aurora"), "a theme that is not installed is not selectable");
+    }
+
+    /// A directory per test, named so that runs on `cargo test`'s threads cannot
+    /// collide with each other.
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "monitor-frontend-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
+    }
+
+    /// One theme package as an upload arrives: a gz-encoded tar in a file the
+    /// test can install from.
+    fn pack(archive: &Path, files: &[(&str, &[u8])]) -> fs::File {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            fs::File::create(archive).unwrap(),
+            flate2::Compression::fast(),
+        ));
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        fs::File::open(archive).unwrap()
+    }
+
+    /// What `install` has to reclaim from a hub that was killed mid-install: a
+    /// staging directory nothing finished unpacking into, and a replaced one
+    /// nothing got around to deleting. Both carry a leading dot, so `themes()`
+    /// and `serve` skip them -- and so does every other path, which leaves the
+    /// next install as the only chance to free that disk.
+    #[test]
+    fn an_install_sweeps_what_a_killed_one_left_behind() {
+        let outer = temp_dir("leftovers");
+        let themes_dir = outer.join("themes");
+        fs::create_dir_all(&themes_dir).unwrap();
+        // A file as well as directories: the prefix is what the sweep matches
+        // on, not the entry type.
+        fs::create_dir(themes_dir.join(format!("{STAGING_PREFIX}0123456789abcdef"))).unwrap();
+        fs::create_dir(themes_dir.join(format!("{REPLACED_PREFIX}0123456789abcdef"))).unwrap();
+        fs::write(themes_dir.join(format!("{REPLACED_PREFIX}fedcba9876543210")), b"stray").unwrap();
+
+        let manifest: &[u8] =
+            r#"{"name":"极光","short":"aurora","description":"","version":"1","author":"a","url":""}"#
+                .as_bytes();
+        let archive = outer.join("upload.tar.gz");
+        let theme = install(
+            &themes_dir,
+            pack(&archive, &[("theme.json", manifest), ("dist/index.html", b"v1")]),
+            None,
+        )
+        .unwrap();
+
+        // The install itself is unaffected by the leftovers, which are not a
+        // reason to refuse it.
+        assert_eq!(theme.short, "aurora");
+        assert_eq!(fs::read(themes_dir.join("aurora/dist/index.html")).unwrap(), b"v1");
+        let left: Vec<_> = fs::read_dir(&themes_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["aurora"]);
+
+        fs::remove_dir_all(outer).unwrap();
+    }
+
+    /// The panel shows whatever `remove` returns, so a theme that is not
+    /// installed and a name it may not delete have to read the same: the raw
+    /// ENOENT from `canonicalize` tells an operator nothing they can act on.
+    #[test]
+    fn deleting_a_theme_that_is_not_installed_reports_it_as_missing() {
+        let base = temp_dir("remove");
+        let outside = temp_dir("remove-outside");
+        fs::create_dir_all(base.join("aurora")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // No directory behind the name: the case that used to answer "No such
+        // file or directory".
+        assert_eq!(remove(&base, "nebula").unwrap_err().to_string(), "没有这个主题");
+        // A name that cannot be a directory at all, refused before the join.
+        assert_eq!(remove(&base, "../etc").unwrap_err().to_string(), "没有这个主题");
+        #[cfg(unix)]
+        {
+            // A symlink leading out of the themes directory resolves to a real
+            // directory the guard refuses; it must answer like the two above.
+            std::os::unix::fs::symlink(&outside, base.join("linked")).unwrap();
+            assert_eq!(remove(&base, "linked").unwrap_err().to_string(), "没有这个主题");
+            assert!(outside.exists(), "a symlink must not be deleted through");
+        }
+        // An installed theme still goes, or this would have traded one bug for
+        // a worse one.
+        remove(&base, "aurora").unwrap();
+        assert!(!base.join("aurora").exists());
+
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    /// A thumbnail over the limit is no thumbnail: nothing that large reaches
+    /// the panel, and the built-in theme installed on disk must still fall back
+    /// to the copy embedded next to its assets rather than to nothing at all.
+    #[test]
+    fn an_oversized_thumbnail_on_disk_leaves_the_embedded_one_in_place() {
+        let base = temp_dir("preview");
+        let default = base.join("default");
+        fs::create_dir_all(default.join("dist")).unwrap();
+        fs::write(default.join("dist/index.html"), "index").unwrap();
+        let manifest: &[u8] =
+            r#"{"name":"默认主题","short":"default","description":"","version":"1","author":"a","url":""}"#
+                .as_bytes();
+        fs::write(default.join("theme.json"), manifest).unwrap();
+        fs::write(default.join(PREVIEW), vec![0u8; MAX_FILE as usize + 1]).unwrap();
+
+        let embedded = DefaultPreview::get(PREVIEW).map(|file| file.data.into_owned());
+        // The assertion below is what the fix turns on, so a theme package that
+        // stopped shipping a thumbnail must fail here rather than pass quietly.
+        assert!(embedded.is_some(), "the pinned default theme ships a preview.png");
+        assert_eq!(preview(&base, "default"), embedded);
+
+        // Below the limit the file on disk still wins, which is what the
+        // fallback must not swallow.
+        fs::write(default.join(PREVIEW), b"disk").unwrap();
+        assert_eq!(preview(&base, "default").unwrap(), b"disk");
+        assert!(preview(&base, "aurora").is_none(), "no directory, no thumbnail of its own");
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// The panel and the stored setting both key a theme by `short`, so a
+    /// directory whose manifest names another one has no name to be selected by.
+    /// It stays out of the list -- the warning is what keeps that from looking
+    /// like the theme was never installed.
+    #[test]
+    fn a_directory_whose_manifest_names_another_theme_stays_out_of_the_list() {
+        let outer = temp_dir("manifest");
+        let themes_dir = outer.join("themes");
+        let root = themes_dir.join("aurora");
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/index.html"), "index").unwrap();
+        let declared: &[u8] =
+            r#"{"name":"极光","short":"nebula","description":"","version":"1","author":"a","url":""}"#
+                .as_bytes();
+        fs::write(root.join("theme.json"), declared).unwrap();
+
+        assert!(manifest(&root, "aurora").is_none());
+
+        // Which is what the panel sees: the built-in theme and nothing beside
+        // it, however many themes the directory holds.
+        let mut app = App::for_test(crate::db::Db::open(":memory:").unwrap());
+        app.themes = themes_dir.clone();
+        let list = themes(&app).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].builtin);
+
+        fs::remove_dir_all(outer).unwrap();
     }
 }
