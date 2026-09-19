@@ -9,6 +9,10 @@
 # terminal to read answers from, so it installs with the defaults rather than
 # waiting on an invisible prompt.
 set -eu
+# useradd resides in sbin, which a root shell entered through `su` without `-`
+# lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH is set, and
+# Debian does not set it.
+PATH="$PATH:/usr/sbin:/sbin"
 
 REPO="monitor-probe/monitor"
 SERVICE="monitor-hub"
@@ -222,6 +226,7 @@ User=$USER_NAME
 WorkingDirectory=$ROOT
 ReadWritePaths=$DATA
 NoNewPrivileges=yes
+RestrictSUIDSGID=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

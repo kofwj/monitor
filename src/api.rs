@@ -1,5 +1,7 @@
 //! The panel and public-status HTTP surface.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
@@ -10,7 +12,7 @@ use axum::Json;
 use chrono::{Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::agent_ws::Agent;
 use crate::auth::{
@@ -99,7 +101,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // A country rather than an address: it indicates which region a node sits
         // in, which is what a status page conveys, without locating it. The
         // address it was derived from remains behind the panel.
-        "country": node.country,
+        "country": if node.country_pin.is_empty() { &node.country } else { &node.country_pin },
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -129,6 +131,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "total_tx": traffic.total_tx,
         "month_rx": traffic.month_rx,
         "month_tx": traffic.month_tx,
+        "month_used": traffic.month_used(&node.traffic_mode),
         "month_start": traffic.month_start,
         // Of the same nature as the month and lifetime figures beside it, which
         // the public page already shows, so this one is public as well.
@@ -150,8 +153,13 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
+        view["ipv4_pin"] = json!(node.ipv4_pin);
+        view["ipv6_pin"] = json!(node.ipv6_pin);
+        view["country_pin"] = json!(node.country_pin);
+        view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
+        view["notify"] = json!(node.notify);
     }
     view
 }
@@ -596,6 +604,71 @@ fn node_text_error(
     None
 }
 
+/// Normalizes the values set by hand, or names the one that cannot stand. Each
+/// takes the place of an automatic value, so it is held to what that value would
+/// have to be: the country to the rule a looked-up one passes, as both reach the
+/// status page; an address to its own family, stored canonical so the panel's
+/// search matches however it was typed.
+fn pins(node: &mut NodePatch) -> Option<&'static str> {
+    if let Some(cc) = &mut node.country_pin {
+        if let Some(e) = pin_country(cc) {
+            return Some(e);
+        }
+    }
+    for (pin, v6) in [(&mut node.ipv4_pin, false), (&mut node.ipv6_pin, true)] {
+        let Some(pin) = pin else { continue };
+        if let Some(e) = pin_address(pin, v6) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// The same two rules for the create path, whose payload is a whole `Node`: its
+/// pins are plain strings rather than the patch's `Option`s, because a create
+/// states every field. Enforced on both writers for the reason [`node_text_error`]
+/// states -- a value one writer refuses must not be reachable through the other --
+/// and the create path is the one the panel uses to add a node by hand.
+fn node_pins(node: &mut Node) -> Option<&'static str> {
+    if let Some(e) = pin_country(&mut node.country_pin) {
+        return Some(e);
+    }
+    for (pin, v6) in [(&mut node.ipv4_pin, false), (&mut node.ipv6_pin, true)] {
+        if let Some(e) = pin_address(pin, v6) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+fn pin_country(cc: &mut String) -> Option<&'static str> {
+    *cc = cc.trim().to_ascii_uppercase();
+    if !cc.is_empty() && !(cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_uppercase())) {
+        return Some("country must be two letters, or empty to look it up");
+    }
+    None
+}
+
+/// One address pin in canonical form, or the shape that cannot stand. An address
+/// of the other family is refused rather than read: the two are shown for their
+/// own family, and `2409::5` under `ipv4_pin` would otherwise reach the panel as
+/// an address that resolves to nothing.
+fn pin_address(pin: &mut String, v6: bool) -> Option<&'static str> {
+    let typed = pin.trim();
+    let parsed = if v6 {
+        typed.parse::<Ipv6Addr>().map(IpAddr::V6)
+    } else {
+        typed.parse::<Ipv4Addr>().map(IpAddr::V4)
+    };
+    *pin = match parsed {
+        Ok(ip) => ip.to_string(),
+        Err(_) if typed.is_empty() => String::new(),
+        Err(_) if v6 => return Some("IPv6 must be an IPv6 address, or empty"),
+        Err(_) => return Some("IPv4 must be an IPv4 address, or empty"),
+    };
+    None
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
@@ -648,6 +721,9 @@ pub async fn create_node(
     ) {
         return bad(&message);
     }
+    if let Some(message) = node_pins(&mut node) {
+        return bad(message);
+    }
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install command is readable from the node list,
@@ -681,8 +757,10 @@ const REGISTER_LIMIT: i64 = 100;
 /// that has never contacted the hub. A key issued by the panel, valid only within
 /// [`REGISTER_WINDOW`], serves in place of a session.
 ///
-/// One request costs two setting reads, a `COUNT` and an `INSERT`. It makes no
-/// outbound request, and the router's 64 KiB body limit bounds the name.
+/// One request costs two setting reads, a `COUNT`, and one transaction inserting
+/// the `node` and `traffic` rows plus a `ping_node` row per `auto_join` probe, at
+/// most 64. It makes no outbound request, and the router's 64 KiB body limit
+/// bounds the name.
 pub async fn agent_register(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -799,6 +877,9 @@ pub async fn update_node(
     ) {
         return bad(&message);
     }
+    if let Some(message) = pins(&mut node) {
+        return bad(message);
+    }
     match app.db.update_node(id, &node) {
         Ok(true) => {
             invalidate_snapshot(&app);
@@ -829,20 +910,28 @@ pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Jso
 }
 
 pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.delete_node(id) {
+        Ok(true) => {}
+        Ok(false) => return missing("no such node"),
+        Err(e) => return fail(e),
+    }
+    // The node is gone from the row, but the mute list holds ids and SQLite hands
+    // this one to the next node created: an entry left here would silence a machine
+    // nobody muted, and nothing would say so. The delete has landed already, so a
+    // failure to clean the list is logged rather than answered -- the panel's node
+    // is gone either way, and the entry is one its list can still be edited to drop.
+    if let Err(e) = crate::alerts::unmute(&app, id) {
+        warn!("node {id} was deleted but its alert mute entry was not dropped: {e:#}");
+    }
     // The token is checked only at the handshake, so deleting the row does not
     // end a connection already open on it; dropping the sender does. Without
     // this the agent would keep reporting under an id SQLite reassigns to the
     // next node created, which would then appear online on another node's
-    // metrics. The same reasoning applies in `reset_token` below.
+    // metrics. Dropped after the delete, so the reconnect that follows finds no
+    // token to accept. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    match app.db.delete_node(id) {
-        Ok(true) => {
-            invalidate_snapshot(&app);
-            Json(json!({"ok": true})).into_response()
-        }
-        Ok(false) => missing("no such node"),
-        Err(e) => fail(e),
-    }
+    invalidate_snapshot(&app);
+    Json(json!({"ok": true})).into_response()
 }
 
 /// Issues a fresh token, invalidating the old one immediately.
@@ -851,9 +940,11 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 /// reinstall the agent. Reading the install command does not pass through here.
 pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let token = random_token();
-    // Whether the node is there is answered by the write below rather than by a
-    // read before it: a node deleted between the two would otherwise be reported
-    // as rotated, and the panel would show a token nothing holds.
+    match app.db.reset_token(id, &token) {
+        Ok(true) => {}
+        Ok(false) => return missing("no such node"),
+        Err(e) => return fail(e),
+    }
     // The token is checked only at the handshake, so a session opened with the
     // old one would continue reporting. Dropping the sender ends that loop; the
     // agent reconnects and is refused. Its own teardown leaves the entry
@@ -862,13 +953,9 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // The token is part of the admin frame, which would otherwise continue to
     // display an install command for the credential just retired.
     invalidate_snapshot(&app);
-    match app.db.reset_token(id, &token) {
-        // The token alone: the panel builds the command, and one place needs to
-        // know its form.
-        Ok(true) => Json(json!({"token": token})).into_response(),
-        Ok(false) => missing("no such node"),
-        Err(e) => fail(e),
-    }
+    // The token alone: the panel builds the command, and one place needs to know
+    // its form.
+    Json(json!({"token": token})).into_response()
 }
 
 pub async fn patch_traffic(
@@ -1549,6 +1636,7 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     for key in ["register_key", "register_until"] {
         out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
     }
+    crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
 }
 
@@ -1640,6 +1728,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "alert_muted_nodes" if !crate::alerts::muted_ok(value) => {
             Some("静音列表是逗号分隔的节点编号".into())
         }
+        k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
@@ -1807,6 +1896,7 @@ mod tests {
                 target: target.to_owned(),
                 interval: 60,
                 nodes: vec![],
+                ..Default::default()
             };
             save_ping_task(Admin, State(app.clone()), Json(task))
         };
@@ -1834,6 +1924,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval,
                 nodes: vec![],
+                ..Default::default()
             };
             save_ping_task(Admin, State(app.clone()), Json(task))
         };
@@ -1988,6 +2079,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
+                ..Default::default()
             })
             .unwrap()
     }
@@ -2194,7 +2286,7 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname` is
         // what a node token in the wrong hands can insert, and what the agent
@@ -2249,6 +2341,20 @@ mod tests {
         assert!(app.agents.read().unwrap().is_empty(), "the node must read as offline at once");
     }
 
+    /// A write naming a node that no longer exists, such as one deleted from
+    /// another tab, is refused rather than reported as saved.
+    #[tokio::test]
+    async fn writes_to_a_missing_node_are_not_found() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let patch = Ok(Json(NodePatch { notify: Some(true), ..Default::default() }));
+        assert_eq!(update_node(Admin, state(), Path(9), patch).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(delete_node(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(reset_token(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
+        let traffic = Json(TrafficPatch { total_rx: Some(1), ..Default::default() });
+        assert_eq!(patch_traffic(Admin, state(), Path(9), traffic).await.status(), StatusCode::NOT_FOUND);
+    }
+
     /// Deleting a node must reach the connection it opened, for the same reason
     /// rotating its token does, and more urgently: SQLite reassigns the freed id
     /// to the next node created. Left connected, the old machine reports under
@@ -2276,6 +2382,72 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
         assert_eq!(nodes[0]["metrics"], Value::Null, "and it has nobody else's metrics");
+    }
+
+    /// Values set by hand take the place of automatic ones, so each is held to
+    /// what the automatic value would have to be, and of the three only the
+    /// country reaches the status page. The create path applies the same rules.
+    #[tokio::test]
+    async fn values_set_by_hand_are_checked_and_only_the_country_goes_public() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        app.db.save_facts(id, &json!({}), "198.51.100.77", "198.51.100.77").unwrap();
+        app.db.set_country(id, "SG", "198.51.100.77").unwrap();
+        let put = |patch: Value| {
+            update_node(
+                Admin,
+                axum::extract::State(app.clone()),
+                Path(id),
+                Ok(Json(serde_json::from_value(patch).unwrap())),
+            )
+        };
+        for bad in [
+            json!({"country_pin": "CHN"}),
+            json!({"country_pin": "中国"}),
+            json!({"country_pin": "C1"}),
+            json!({"ipv4_pin": "2409:8a1e::5"}),
+            json!({"ipv4_pin": "203.0.113.9:22"}),
+            json!({"ipv4_pin": "203.0.113.256"}),
+            json!({"ipv6_pin": "203.0.113.9"}),
+            json!({"ipv6_pin": "[2409:8a1e::5]:22"}),
+        ] {
+            assert_eq!(put(bad.clone()).await.status(), StatusCode::BAD_REQUEST, "accepted {bad}");
+        }
+        let typed =
+            json!({"country_pin": " cn ", "ipv4_pin": " 203.0.113.9 ", "ipv6_pin": "2409:8A1E:0::0088"});
+        assert_eq!(put(typed).await.status(), StatusCode::OK);
+        let stored = app.db.node(id).unwrap().unwrap();
+        assert_eq!(
+            (stored.country_pin.as_str(), stored.ipv4_pin.as_str(), stored.ipv6_pin.as_str()),
+            ("CN", "203.0.113.9", "2409:8a1e::88"),
+            "stored canonical"
+        );
+
+        let public = visible_nodes(&app, false).unwrap()[0].to_string();
+        assert!(public.contains(r#""country":"CN""#), "the pin replaces the looked-up country: {public}");
+        assert!(
+            !public.contains("203.0.113.9") && !public.contains("2409:8a1e::88") && !public.contains("SG")
+        );
+        let full = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(
+            (full["country_auto"].as_str(), full["ipv4_pin"].as_str()),
+            (Some("SG"), Some("203.0.113.9"))
+        );
+
+        // A hello leaves the pins alone; empty returns each to automatic.
+        app.db.save_facts(id, &json!({}), "198.51.100.88", "198.51.100.88").unwrap();
+        assert_eq!(app.db.node(id).unwrap().unwrap().ipv4_pin, "203.0.113.9");
+        assert_eq!(
+            put(json!({"country_pin": "", "ipv4_pin": " ", "ipv6_pin": ""})).await.status(),
+            StatusCode::OK
+        );
+        let stored = app.db.node(id).unwrap().unwrap();
+        assert!(stored.country_pin.is_empty() && stored.ipv4_pin.is_empty() && stored.ipv6_pin.is_empty());
+        assert_eq!(
+            visible_nodes(&app, false).unwrap()[0]["country"],
+            "",
+            "back to the lookup, which the new address left owing"
+        );
     }
 
     /// Both writers enforce the same limits. The create path formerly accepted a
@@ -2308,6 +2480,59 @@ mod tests {
             assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
         }
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+    }
+
+    /// The pins are held to their rules on both writers, and stored the same way by
+    /// each: the create form carries the same three fields, and a country or an
+    /// address one path refuses must not be storable through the other. Canonical
+    /// in both cases, because the panel's search and the status page read what came
+    /// back rather than what was typed.
+    #[tokio::test]
+    async fn both_write_paths_check_the_pins_and_store_them_canonically() {
+        let app = std::sync::Arc::new(app());
+        let create = |value: Value, app: &std::sync::Arc<App>| {
+            create_node(
+                Admin,
+                axum::extract::State(app.clone()),
+                domain_headers(),
+                Ok(Json(serde_json::from_value(value).unwrap())),
+            )
+        };
+        for bad in [
+            json!({"name": "x", "country_pin": "CHN"}),
+            json!({"name": "x", "country_pin": "C1"}),
+            json!({"name": "x", "ipv4_pin": "2409:8a1e::5"}),
+            json!({"name": "x", "ipv6_pin": "203.0.113.9"}),
+        ] {
+            assert_eq!(create(bad.clone(), &app).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(app.db.nodes().unwrap().len(), 0, "nothing was created");
+
+        let typed = json!({"name": "n", "country_pin": " cn ", "ipv4_pin": " 203.0.113.9 ", "ipv6_pin": "2409:8A1E:0::0088"});
+        assert_eq!(create(typed, &app).await.status(), StatusCode::OK);
+        let stored = app.db.nodes().unwrap().pop().unwrap();
+        assert_eq!(
+            (stored.country_pin.as_str(), stored.ipv4_pin.as_str(), stored.ipv6_pin.as_str()),
+            ("CN", "203.0.113.9", "2409:8a1e::88"),
+            "stored canonical"
+        );
+        // And the pin is what the public page shows, as it is for a patch.
+        let public = visible_nodes(&app, false).unwrap()[0].to_string();
+        assert!(public.contains(r#""country":"CN""#), "{public}");
+    }
+
+    /// Deleting a node takes it out of the alert mute list. The list holds ids and
+    /// SQLite hands a deleted node's id to the next node created, so an entry left
+    /// behind would mute a machine nobody muted; see `alerts::unmute`.
+    #[tokio::test]
+    async fn deleting_a_node_drops_its_mute_entry() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "muted", true);
+        app.db.set("alert_muted_nodes", &format!("{id}")).unwrap();
+
+        let deleted = delete_node(Admin, axum::extract::State(app.clone()), Path(id)).await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert_eq!(app.db.get("alert_muted_nodes").as_deref(), Some(""));
     }
 
     /// A stream outlives the request that opened it, so everything the handshake
@@ -2343,7 +2568,7 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "").unwrap();
 
         let public = live_snapshot(&app, false);
         let admin = live_snapshot(&app, true);
@@ -2509,6 +2734,7 @@ mod tests {
                 id,
                 &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
                 "ip",
+                "",
             )
             .unwrap();
 
@@ -2777,6 +3003,13 @@ mod tests {
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
             "public_page": "on",
+            "notify_grace": read["notify_grace"],
+            "notify_traffic": read["notify_traffic"],
+            "notify_expiry": read["notify_expiry"],
+            "notify_login": read["notify_login"],
+            "notify_telegram_chat": read["notify_telegram_chat"],
+            "notify_telegram_text": read["notify_telegram_text"],
+            "notify_webhook_body": read["notify_webhook_body"],
         });
         assert_eq!(
             save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
@@ -2787,16 +3020,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_never_hand_back_the_github_secret() {
+    async fn settings_never_hand_back_a_secret() {
         let app = app();
         app.db.set("github_client_secret", "super-secret").unwrap();
         app.db.set("github_client_id", "public-id").unwrap();
+        app.db.set("notify_telegram_token", "123:bot-secret").unwrap();
+        app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
+        app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
 
         let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
+        assert_eq!(body["notify_webhook_url_set"], true);
         assert!(body.get("github_client_secret").is_none());
-        assert!(!body.to_string().contains("super-secret"));
+        for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
+            assert!(!body.to_string().contains(secret), "{secret}");
+        }
     }
 
     /// The alert page and this route keep separate lists of the same keys, and
@@ -3024,7 +3263,14 @@ mod tests {
             save_ping_task(
                 Admin,
                 State(app.clone()),
-                Json(PingTask { id: 0, name, target: "1.1.1.1:443".into(), interval: 60, nodes: vec![id] }),
+                Json(PingTask {
+                    id: 0,
+                    name,
+                    target: "1.1.1.1:443".into(),
+                    interval: 60,
+                    nodes: vec![id],
+                    ..Default::default()
+                }),
             )
         };
 

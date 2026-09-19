@@ -3,6 +3,10 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 set -eu
+# useradd and rc-update reside in sbin, which a root shell entered through `su`
+# without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
+# is set, and Debian does not set it.
+PATH="$PATH:/usr/sbin:/sbin"
 
 # Binary and token in one directory, the same one the hub uses, giving a node a
 # single path to inspect and a single path to remove.
@@ -110,6 +114,16 @@ elif command -v rc-update >/dev/null; then
 else
 	echo "this installer needs systemd or OpenRC" >&2
 	exit 1
+fi
+
+# The service user the unit below runs as, created before the download and the
+# registration, so a host where this fails keeps the agent it already runs and
+# spends no registration key. OpenRC has no equivalent and Alpine ships no
+# useradd, which is why this is confined to systemd.
+if [ "$INIT" = systemd ]; then
+	id -u monitor-agent >/dev/null 2>&1 ||
+		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent ||
+		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
 fi
 
 case "$(uname -m)" in
@@ -245,8 +259,14 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
-DynamicUser=yes
+# A fixed user rather than DynamicUser=: when the mount namespace cannot be
+# created, as in an LXC container without nesting, systemd skips ProtectSystem=
+# and the other mount sandboxing for a unit with a static User=, but refuses to
+# start one with DynamicUser= and exits 226/NAMESPACE. DynamicUser= also implied
+# RestrictSUIDSGID=, which is therefore stated below.
+User=monitor-agent
 NoNewPrivileges=yes
+RestrictSUIDSGID=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

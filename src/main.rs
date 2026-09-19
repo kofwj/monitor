@@ -10,6 +10,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod notify;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -60,10 +61,18 @@ pub struct App {
     /// Which peers may set `X-Forwarded-For` on a caller's behalf: loopback, plus
     /// whatever `--trusted-proxy` named. See [`auth::TrustedProxies`].
     pub trusted_proxies: auth::TrustedProxies,
+    /// Alerts on their way out; see `notify::send`.
+    pub notes: tokio::sync::mpsc::Sender<notify::Note>,
 }
 
 impl App {
-    fn new(db: Db, site: String, themes: PathBuf, trusted_proxies: auth::TrustedProxies) -> Self {
+    fn new(
+        db: Db,
+        site: String,
+        themes: PathBuf,
+        trusted_proxies: auth::TrustedProxies,
+        notes: tokio::sync::mpsc::Sender<notify::Note>,
+    ) -> Self {
         Self {
             db,
             agents: RwLock::default(),
@@ -77,12 +86,20 @@ impl App {
             site,
             themes,
             trusted_proxies,
+            notes,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        Self::new(db, String::new(), PathBuf::from("themes"), auth::TrustedProxies::default())
+        // Nothing delivers in tests; `notify::send` drops into the closed channel.
+        Self::new(
+            db,
+            String::new(),
+            PathBuf::from("themes"),
+            auth::TrustedProxies::default(),
+            tokio::sync::mpsc::channel(1).0,
+        )
     }
 
     pub fn public_page(&self) -> bool {
@@ -508,11 +525,13 @@ async fn main() -> Result<()> {
     // ever reclaims it; `frontend::discard_leftovers` says why the sweep is here
     // rather than at the start of each install.
     frontend::discard_leftovers(&args.themes);
+    let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(
         Db::open(&args.database)?,
         args.site.clone(),
         args.themes,
         args.trusted_proxies.clone(),
+        notes,
     ));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
@@ -565,6 +584,8 @@ async fn main() -> Result<()> {
     // and an offline node announced within the hour is an offline node announced
     // after whatever it was hosting had already been down for an hour.
     tokio::spawn(alerts::run(app.clone()));
+    tokio::spawn(notify::deliver(app.clone(), inbox));
+    tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
         // Agents.
@@ -595,6 +616,7 @@ async fn main() -> Result<()> {
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/alerts/test", post(alerts::test))
+        .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
@@ -777,7 +799,9 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     // until 08:00 while the panel already shows it expired.
     let today = Local::now().date_naive();
     let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-    for node in app.db.nodes()? {
+    let nodes = app.db.nodes()?;
+    let mut rolled = Vec::new();
+    for node in &nodes {
         if !online.contains(&node.id) {
             continue;
         }
@@ -787,11 +811,14 @@ fn renew_online_nodes(app: &App) -> Result<()> {
         let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
         app.db.set_expiry(node.id, &next.to_string())?;
         info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
+        rolled.push((node.name.as_str(), format!("{expires} → {next}")));
     }
+    notify::renewed(app, rolled);
     Ok(())
 }
 
-/// Expires sessions, trims history and rolls over expiry dates once an hour.
+/// Expires sessions, trims history, rolls over expiry dates and sends the daily
+/// expiry digest, once an hour.
 async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
@@ -806,6 +833,12 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = renew_online_nodes(&app) {
             warn!("rolling expiry dates failed: {e:#}");
         }
+        // After the roll-over, so the digest lists dates as they now stand.
+        match notify::expiry_digest(&app, Local::now()) {
+            Ok(Some(note)) => notify::send(&app, note),
+            Ok(None) => {}
+            Err(e) => warn!("expiry digest failed: {e:#}"),
+        }
     }
 }
 
@@ -815,7 +848,13 @@ mod tests {
     use axum::http::{StatusCode, Uri};
 
     fn app(site: &str) -> App {
-        App::new(Db::open(":memory:").unwrap(), site.into(), PathBuf::from("themes"), Default::default())
+        App::new(
+            Db::open(":memory:").unwrap(),
+            site.into(),
+            PathBuf::from("themes"),
+            auth::TrustedProxies::default(),
+            tokio::sync::mpsc::channel(1).0,
+        )
     }
 
     /// A request as a reverse proxy would forward it, or as it arrives with none

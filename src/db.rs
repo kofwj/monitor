@@ -55,13 +55,28 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
-  -- ISO 3166-1 alpha-2, looked up from `ip` once per address. Empty until the
-  -- lookup answers, and empty is what a node whose country nobody could tell
-  -- stays: the public page just leaves the badge off.
+  -- ISO 3166-1 alpha-2, looked up from `country_ip` once per address. Empty
+  -- until the lookup answers, and empty is what a node whose country nobody
+  -- could tell stays: the public page just leaves the badge off.
   country TEXT NOT NULL DEFAULT '',
+  -- The address `country` belongs to: a public interface address the agent
+  -- reported, else `ip`. Empty when neither is public.
+  country_ip TEXT NOT NULL DEFAULT '',
+  -- Set in the panel. When not empty it is the country shown, in place of the
+  -- looked-up one, which goes on updating underneath.
+  country_pin TEXT NOT NULL DEFAULT '',
+  -- Set in the panel, each replacing the address shown for its family. Empty
+  -- means automatic. Panel only, like the reported addresses.
+  ipv4_pin TEXT NOT NULL DEFAULT '', ipv6_pin TEXT NOT NULL DEFAULT '',
   -- Survives the disconnection it describes, unlike the in-memory live entry:
   -- an offline node's page is exactly where "since when" is worth reading.
   last_seen INTEGER NOT NULL DEFAULT 0,
+  -- Opt-in, as the operator decides which machines are worth an alert.
+  notify INTEGER NOT NULL DEFAULT 0,
+  -- `last_seen` as of the offline alert, zero while none is outstanding. Stored
+  -- rather than held in memory so that a hub restart neither repeats the alert
+  -- nor loses the recovery that pairs with it.
+  down_since INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
 
@@ -95,7 +110,8 @@ CREATE TABLE IF NOT EXISTS ping_task (
   id       INTEGER PRIMARY KEY,
   name     TEXT    NOT NULL,
   target   TEXT    NOT NULL,
-  interval INTEGER NOT NULL DEFAULT 60
+  interval INTEGER NOT NULL DEFAULT 60,
+  auto_join INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ping_node (
@@ -146,8 +162,33 @@ CREATE TABLE IF NOT EXISTS alert_state (
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
-/// database already in service.
-const SCHEMA_VERSION: i64 = 4;
+/// database already in service. Every migration must be:
+///
+/// - Additive: a new column carries a default, and no column an earlier build
+///   reads is renamed or dropped. install-hub.sh rolls a hub that fails to start
+///   back to the previous binary, which then runs on the migrated file.
+/// - Safe to run twice: an earlier build stamps its own, lower version into a
+///   newer file, and the next upgrade runs the migration again.
+///
+/// A new column goes into `SCHEMA` as well, for fresh files, but an index on it
+/// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
+/// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
+/// holds every migration to these rules, starting from v1.0.0's schema.
+///
+/// 4 was claimed by both sides. Upstream's `feat/notify` took it for
+/// `node.notify` and `node.down_since` and reached 6 before the two forks met;
+/// this fork's 4 created `alert_state` and nothing else, so ours moved past
+/// upstream's newest. It moved further than the next free number on purpose: 7
+/// is what upstream's next migration would take, and a file stamped twice for
+/// two different shapes cannot be told apart -- upstream's `if from < 7` would
+/// be false on our file and its column would be missing with nothing logged.
+/// 16 leaves that collision nine schema changes away.
+///
+/// A file the fork stamped 4 while it was 4 is also why `migrate` runs upstream's
+/// 4 and 5 together rather than behind `from < 4`: that stamp says nothing about
+/// the columns those migrations add, and the file is otherwise indistinguishable
+/// from one upstream stamped 4 itself.
+const SCHEMA_VERSION: i64 = 16;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -208,16 +249,14 @@ fn migrate_to_1(conn: &Connection) -> Result<()> {
     // retention.
     if schema_mentions(conn, "ping_record", "(node_id, task_id, ts)")? {
         conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE ping_record_rekeyed (
+            "CREATE TABLE ping_record_rekeyed (
                node_id INTEGER NOT NULL, task_id INTEGER NOT NULL,
                ts INTEGER NOT NULL, latency INTEGER NOT NULL,
                PRIMARY KEY (node_id, ts, task_id)
              ) WITHOUT ROWID;
              INSERT INTO ping_record_rekeyed SELECT * FROM ping_record;
              DROP TABLE ping_record;
-             ALTER TABLE ping_record_rekeyed RENAME TO ping_record;
-             COMMIT;",
+             ALTER TABLE ping_record_rekeyed RENAME TO ping_record;",
         )?;
         info!("rebuilt ping_record on a key the latency chart can seek");
     }
@@ -244,29 +283,49 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
 }
 
-/// `alert_state` arrives with 4. A database this build creates for itself gets it
-/// from `SCHEMA`, so for the live file this is a no-op; a v3 upload does not, and
-/// `check_backup` runs the migrations before the copy rather than after, so
-/// without this the restore of any backup predating 4 is refused.
+fn migrate_to_4(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "notify INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "node", "down_since INTEGER NOT NULL DEFAULT 0")
+}
+
+/// Every country stored until now was looked up from `ip`. Recording that
+/// keeps the badge of a node whose lookup address is still `ip`, and has a node
+/// whose public interface address now takes precedence looked up again at its
+/// next hello. The columns set by hand start empty: automatic.
+fn migrate_to_5(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "country_ip TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "country_pin TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "ipv4_pin TEXT NOT NULL DEFAULT ''")?;
+    add_column(conn, "node", "ipv6_pin TEXT NOT NULL DEFAULT ''")?;
+    conn.execute("UPDATE node SET country_ip = ip WHERE country != ''", [])?;
+    Ok(())
+}
+
+fn migrate_to_6(conn: &Connection) -> Result<()> {
+    add_column(conn, "ping_task", "auto_join INTEGER NOT NULL DEFAULT 0")
+}
+
+/// `alert_state` arrives with 16, the one number this fork owns: it was 4 until
+/// the merge, and upstream's `feat/notify` had claimed 4 as well, for two columns
+/// rather than for a table. What the note here used to say would have to happen
+/// when the two forks met is what happened, and the number went past upstream's
+/// newest -- 6 -- and past the 7 their next one will take, so that no file
+/// carries one stamp for two shapes.
+///
+/// A database this build creates for itself gets the table from `SCHEMA`, so for
+/// the live file this is a no-op; a v3 upload does not, and `check_backup` runs
+/// the migrations before the copy rather than after, so without this the restore
+/// of any backup predating the fork's 4 is refused.
 ///
 /// The DDL is restated here rather than shared with `SCHEMA`, which is what
 /// migrations are: the shape as of the version being reached, frozen once
 /// shipped. `SCHEMA` tracks whatever the current shape is, so a column added to
-/// this table later reaches an old file through a `migrate_to_5` instead.
-///
-/// Version 4 is contested. Upstream's `feat/notify` (PR #10, merged 2026-09-16)
-/// claims 4 as well, for a `migrate_to_4` that adds `node.notify` and
-/// `node.down_since` rather than this table. The two have not met yet: this fork
-/// has not merged upstream since, so nothing here has moved. When they do meet,
-/// this migration moves whole -- bump `SCHEMA_VERSION` to 5, rename this to
-/// `migrate_to_5`, and add the `from < 5` branch beside theirs, leaving upstream's
-/// at 4. A file this build already stamped 4 re-runs it harmlessly, because the
-/// table is created with `IF NOT EXISTS`.
+/// this table later reaches an old file through a `migrate_to_17` instead.
 ///
 /// The failure mode is why this is written here rather than left to a note
 /// somewhere: a version number that does not line up leaves the table missing and
 /// says nothing in the log.
-fn migrate_to_4(conn: &Connection) -> Result<()> {
+fn migrate_to_16(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS alert_state (
            node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
@@ -284,22 +343,45 @@ fn migrate_to_4(conn: &Connection) -> Result<()> {
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
 ///
+/// One transaction covers every step and the stamp. SQLite rolls back schema
+/// changes and `user_version` alike, so a failure part-way -- a full disk, a
+/// killed process -- leaves the file at the version it started from rather than
+/// between two.
+///
 /// Restoring a backup also arrives here: the copy carries its own version and
 /// requires the same migrations a restart would have run.
 fn migrate(conn: &Connection, from: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     if from < 1 {
-        migrate_to_1(conn)?;
+        migrate_to_1(&tx)?;
     }
     if from < 2 {
-        migrate_to_2(conn)?;
+        migrate_to_2(&tx)?;
     }
     if from < 3 {
-        migrate_to_3(conn)?;
+        migrate_to_3(&tx)?;
     }
-    if from < 4 {
-        migrate_to_4(conn)?;
+    // Upstream's 4 and 5 arrive together for anything below 5, rather than each
+    // behind its own `from < N`: this fork claimed 4 as well, so a file it stamped
+    // 4 carries `alert_state` and none of upstream's 4-columns, and `from < 4`
+    // would leave a file that reports itself current without `node.notify`.
+    // Running both is safe on a file that already has them -- `add_column` treats
+    // a duplicate column as a migration that has run -- and the UPDATE that fills
+    // `country_ip` is only reached by a file that predates the column. That is
+    // what lets the two numberings meet without anyone inspecting which 4 a file
+    // carries.
+    if from < 5 {
+        migrate_to_4(&tx)?;
+        migrate_to_5(&tx)?;
     }
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    if from < 6 {
+        migrate_to_6(&tx)?;
+    }
+    if from < 16 {
+        migrate_to_16(&tx)?;
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -389,14 +471,32 @@ pub struct Node {
     pub ipv4: String,
     #[serde(default)]
     pub ipv6: String,
-    /// ISO 3166-1 alpha-2 for `ip`, uppercase, or empty when unknown. Public: it
-    /// appears on the status page beside the node's name.
+    /// ISO 3166-1 alpha-2, uppercase, or empty when unknown; see
+    /// `agent_ws::country_source` for the address it is looked up from. Public:
+    /// it appears on the status page beside the node's name.
     #[serde(default)]
     pub country: String,
+    /// Set in the panel: two uppercase letters, or empty for the looked-up
+    /// `country`. What the status page shows is this when present.
+    #[serde(default)]
+    pub country_pin: String,
+    /// Set in the panel, in canonical form, for what neither agent nor hub can
+    /// know: the home line behind a transparent proxy, or which of several public
+    /// addresses to show. Each replaces the address shown for its family; empty
+    /// is automatic. Panel only, like `ip`.
+    #[serde(default)]
+    pub ipv4_pin: String,
+    #[serde(default)]
+    pub ipv6_pin: String,
     /// Unix seconds of the node's last report, written once a minute alongside
     /// the metric row. Zero for a node that has never reported.
     #[serde(default)]
     pub last_seen: i64,
+    /// Whether going offline and coming back are announced. See `notify`.
+    #[serde(default)]
+    pub notify: bool,
+    #[serde(default)]
+    pub down_since: i64,
     /// What the agent authenticates with. Readable so the panel can display an
     /// install command on demand; it never leaves the admin view.
     #[serde(default)]
@@ -422,6 +522,10 @@ pub struct NodePatch {
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
+    pub notify: Option<bool>,
+    pub country_pin: Option<String>,
+    pub ipv4_pin: Option<String>,
+    pub ipv6_pin: Option<String>,
 }
 
 fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
@@ -473,7 +577,22 @@ pub struct AlertState {
     pub notified: i64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+impl Traffic {
+    /// This period's usage as the node's plan meters it. Summing both directions
+    /// regardless would hold a plan billed on upload alone against the wrong
+    /// figure. The traffic alert and `node_view` both read this, so the
+    /// percentage an alert quotes matches the usage the pages show.
+    pub fn month_used(&self, traffic_mode: &str) -> i64 {
+        match traffic_mode {
+            "up" => self.month_tx,
+            "down" => self.month_rx,
+            "max" => self.month_rx.max(self.month_tx),
+            _ => self.month_rx.saturating_add(self.month_tx),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PingTask {
     #[serde(default)]
     pub id: i64,
@@ -483,6 +602,16 @@ pub struct PingTask {
     pub interval: i64,
     #[serde(default)]
     pub nodes: Vec<i64>,
+    /// Nodes created later are assigned this probe as they are added. Existing
+    /// nodes follow `nodes` alone.
+    #[serde(default)]
+    pub auto_join: bool,
+    /// The assignments the editor started from. When given on an update, only
+    /// the difference between it and `nodes` is applied, so an assignment made
+    /// while the editor was open -- a node joining through `auto_join` -- is
+    /// not removed by a list that predates it.
+    #[serde(default, skip_serializing)]
+    pub base: Option<Vec<i64>>,
 }
 
 /// Restricts the database to its owner.
@@ -602,8 +731,14 @@ impl Db {
 
     /// Creates a node and returns its id.
     ///
-    /// Both rows or neither: `accumulate` reads the `traffic` row on every
-    /// report, so a node lacking one cannot report.
+    /// One transaction: `accumulate` reads the `traffic` row on every report, so
+    /// a node lacking one cannot report. The node also takes every `auto_join`
+    /// probe here, at most [`Self::MAX_PROBES_PER_NODE`] rows, a limit
+    /// `save_ping_task` enforces.
+    ///
+    /// The values set by hand -- the country pin and the two address pins -- are
+    /// stored as they arrive, and `api::node_pins` is what keeps them canonical;
+    /// leaving them out of the insert silently dropped what the create form sent.
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -611,8 +746,10 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day,
+                               country_pin, ipv4_pin, ipv6_pin, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,
+                     ?12,?13,?14,?15)",
             params![
                 n.name,
                 token,
@@ -625,11 +762,18 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
+                n.country_pin,
+                n.ipv4_pin,
+                n.ipv6_pin,
                 Utc::now().timestamp()
             ],
         )?;
         let id = tx.last_insert_rowid();
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        tx.execute(
+            "INSERT INTO ping_node (task_id, node_id) SELECT id, ?1 FROM ping_task WHERE auto_join",
+            [id],
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -647,15 +791,18 @@ impl Db {
         Ok(())
     }
 
+    /// False when no node has this id.
     pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<bool> {
-        let changed = self.conn().execute(
+        let found = self.conn().execute(
             "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
                              price=COALESCE(?5,price), currency=COALESCE(?6,currency),
                              billing_cycle=COALESCE(?7,billing_cycle),
                              expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
                              remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
                              traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day)
+                             traffic_reset_day=COALESCE(?13,traffic_reset_day),
+                             notify=COALESCE(?14,notify), country_pin=COALESCE(?15,country_pin),
+                             ipv4_pin=COALESCE(?16,ipv4_pin), ipv6_pin=COALESCE(?17,ipv6_pin)
              WHERE id=?1",
             params![
                 id,
@@ -670,15 +817,24 @@ impl Db {
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
-                n.traffic_reset_day
+                n.traffic_reset_day,
+                n.notify,
+                n.country_pin,
+                n.ipv4_pin,
+                n.ipv6_pin
             ],
         )?;
-        Ok(changed == 1)
+        Ok(found > 0)
     }
 
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<bool> {
         let changed = self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
         Ok(changed == 1)
+    }
+
+    pub fn set_down_since(&self, id: i64, ts: i64) -> Result<()> {
+        self.conn().execute("UPDATE node SET down_since=?2 WHERE id=?1", params![id, ts])?;
+        Ok(())
     }
 
     pub fn reorder_nodes(&self, ids: &[i64]) -> Result<()> {
@@ -701,6 +857,7 @@ impl Db {
         Ok(())
     }
 
+    /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
@@ -709,13 +866,13 @@ impl Db {
         // inherit the removed machine's latency chart.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
         // The node's own delete, not the sweep above, is what says it was there.
-        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? == 1)
+        Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
 
-    /// Replaces a node's token, which immediately locks out the old one.
+    /// Replaces a node's token, which immediately locks out the old one. False
+    /// when no node has this id.
     pub fn reset_token(&self, id: i64, token: &str) -> Result<bool> {
-        let changed = self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])?;
-        Ok(changed == 1)
+        Ok(self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])? > 0)
     }
 
     pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
@@ -723,12 +880,14 @@ impl Db {
     }
 
     /// Stores the slow-changing facts an agent sends on connect, and reports
-    /// whether the node still requires a country lookup.
+    /// whether the node still requires a country lookup for `source`, the address
+    /// `agent_ws::country_source` chose. An empty `source` has no country and is
+    /// never owed one.
     ///
-    /// A new address invalidates the previous country, so the two move together in
+    /// A new source invalidates the previous country, so the two move together in
     /// one statement: `SET` reads the row as it was, so the comparison is against
     /// the stored address rather than the one being written.
-    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<bool> {
+    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, source: &str) -> Result<bool> {
         // The same rule `api::agent_register` applies to the name it receives:
         // these values come from an unvouched machine, control characters break
         // the panel's rows, and the length must be bounded. Six of them -- os,
@@ -761,7 +920,8 @@ impl Db {
                              swap_total=COALESCE(?10,swap_total), disk_total=COALESCE(?11,disk_total),
                              agent_version=COALESCE(?12,agent_version),
                              ip=?13, ipv4=COALESCE(?14,ipv4), ipv6=COALESCE(?15,ipv6),
-                             country=CASE WHEN ip=?13 THEN country ELSE '' END
+                             country_ip=?16,
+                             country=CASE WHEN country_ip=?16 THEN country ELSE '' END
              WHERE id=?1",
             params![
                 id,
@@ -778,10 +938,26 @@ impl Db {
                 s("agent_version"),
                 ip,
                 s("ipv4"),
-                s("ipv6")
+                s("ipv6"),
+                source
             ],
         )?;
-        Ok(conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?)
+        let blank: bool = conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?;
+        Ok(blank && !source.is_empty())
+    }
+
+    /// Whether the node still lacks a country for `source`: false once a lookup
+    /// has landed, or once the node has moved to another address.
+    pub fn country_owed(&self, id: i64, source: &str) -> Result<bool> {
+        let owed = self
+            .conn()
+            .query_row(
+                "SELECT country = '' FROM node WHERE id=?1 AND country_ip=?2",
+                params![id, source],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(owed.unwrap_or(false))
     }
 
     /// Records the country a lookup returned, unless the node moved to another
@@ -790,8 +966,9 @@ impl Db {
     /// was asked about, so a late answer for an address the node has left is not
     /// an answer about the node. Kept apart from the panel's own writes:
     /// `update_node` never touches this column.
-    pub fn set_country(&self, id: i64, cc: &str, ip: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET country=?2 WHERE id=?1 AND ip=?3", params![id, cc, ip])?;
+    pub fn set_country(&self, id: i64, cc: &str, source: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE node SET country=?2 WHERE id=?1 AND country_ip=?3", params![id, cc, source])?;
         Ok(())
     }
 
@@ -1052,6 +1229,8 @@ impl Db {
     /// they would belong to whichever period the row still held, `all_traffic`
     /// would read them back as zero, and the node's next report would restart the
     /// counter and discard the correction.
+    ///
+    /// False when no node has this id.
     pub fn set_traffic(&self, node_id: i64, p: &TrafficPatch) -> Result<bool> {
         let conn = self.conn();
         // `optional` rather than a bare `query_row`: a node that is not there is
@@ -1148,7 +1327,8 @@ impl Db {
 
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id, name, target, interval FROM ping_task ORDER BY id")?;
+        let mut stmt =
+            conn.prepare("SELECT id, name, target, interval, auto_join FROM ping_task ORDER BY id")?;
         let tasks: Vec<PingTask> = stmt
             .query_map([], |r| {
                 Ok(PingTask {
@@ -1157,6 +1337,8 @@ impl Db {
                     target: r.get(2)?,
                     interval: r.get(3)?,
                     nodes: Vec::new(),
+                    auto_join: r.get(4)?,
+                    base: None,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1184,53 +1366,81 @@ impl Db {
     /// in step; the agent's copy is the backstop rather than the message.
     const MAX_PROBES_PER_NODE: i64 = 64;
 
-    /// The assignments are replaced wholesale, so they run in one transaction:
-    /// failing between the delete and the inserts would unassign every node from
-    /// a probe the panel still lists them under.
+    /// Replaces the assignments wholesale, or with `base` applies only what
+    /// changed from it. Either way in one transaction: failing between the
+    /// deletes and the inserts would unassign nodes from a probe the panel still
+    /// lists them under.
     pub fn save_ping_task(&self, t: &PingTask) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let id = if t.id > 0 {
-            let matched = tx.execute(
-                "UPDATE ping_task SET name=?2, target=?3, interval=?4 WHERE id=?1",
-                params![t.id, t.name, t.target, t.interval],
+            let updated = tx.execute(
+                "UPDATE ping_task SET name=?2, target=?3, interval=?4, auto_join=?5 WHERE id=?1",
+                params![t.id, t.name, t.target, t.interval, t.auto_join],
             )?;
-            if matched != 1 {
-                // An unknown id used to fall through to the assignment writes
-                // below and report success carrying the id it was handed; with no
-                // nodes assigned, the foreign key never fires either.
-                anyhow::bail!("探测任务 {} 不存在", t.id);
+            // Deleted from another session. Without this the first assignment
+            // would fail on the task's foreign key and be reported against a
+            // node, or, with none, the save would report success.
+            if updated == 0 {
+                anyhow::bail!("监控不存在，可能已被删除");
             }
             t.id
         } else {
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval) VALUES (?1,?2,?3)",
-                params![t.name, t.target, t.interval],
+                "INSERT INTO ping_task (name, target, interval, auto_join) VALUES (?1,?2,?3,?4)",
+                params![t.name, t.target, t.interval, t.auto_join],
             )?;
             tx.last_insert_rowid()
         };
-        tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
-        for node in &t.nodes {
-            // The foreign key is the check; naming the node turns SQLite's
-            // "FOREIGN KEY constraint failed" into something the panel can show.
-            tx.execute("INSERT INTO ping_node (task_id, node_id) VALUES (?1,?2)", params![id, node])
-                .with_context(|| format!("节点 {node} 不存在"))?;
+        let added: Vec<i64> = match &t.base {
+            Some(base) if t.id > 0 => {
+                for node in base.iter().filter(|n| !t.nodes.contains(n)) {
+                    tx.execute("DELETE FROM ping_node WHERE task_id=?1 AND node_id=?2", params![id, node])?;
+                }
+                t.nodes.iter().filter(|n| !base.contains(n)).copied().collect()
+            }
+            _ => {
+                tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
+                t.nodes.clone()
+            }
+        };
+        for node in &added {
+            // OR IGNORE covers a node that joined while the editor was open and
+            // was then ticked. It does not cover the foreign key, which remains
+            // the check; naming the node turns SQLite's "FOREIGN KEY constraint
+            // failed" into something the panel can show.
+            tx.execute(
+                "INSERT OR IGNORE INTO ping_node (task_id, node_id) VALUES (?1,?2)",
+                params![id, node],
+            )
+            .with_context(|| format!("节点 {node} 不存在"))?;
         }
         // Queried from the table after the rows are in rather than counted from
-        // the request: an update replaces this task's own assignments, so
+        // the request: an update changes this task's own assignments, so
         // arithmetic on the way in would have to subtract them again. The
         // transaction makes this atomic with the write, and bailing here rolls it
         // back.
-        let crowded: Option<i64> = tx
+        // By name: the panel identifies nodes by name and never shows an id.
+        let crowded: Option<String> = tx
             .query_row(
-                "SELECT node_id FROM ping_node GROUP BY node_id HAVING COUNT(*) > ?1 LIMIT 1",
+                "SELECT n.name FROM ping_node p JOIN node n ON n.id = p.node_id
+                 GROUP BY p.node_id HAVING COUNT(*) > ?1 LIMIT 1",
                 [Self::MAX_PROBES_PER_NODE],
                 |r| r.get(0),
             )
             .optional()?;
         if let Some(node) = crowded {
             anyhow::bail!(
-                "节点 {node} 会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                "节点「{node}」会被分配超过 {} 个探测任务，agent 最多只跑这么多，多出来的会被静默丢掉",
+                Self::MAX_PROBES_PER_NODE
+            );
+        }
+        // The next node created receives every auto-joining probe at once.
+        let joining: i64 =
+            tx.query_row("SELECT COUNT(*) FROM ping_task WHERE auto_join", [], |r| r.get(0))?;
+        if joining > Self::MAX_PROBES_PER_NODE {
+            anyhow::bail!(
+                "新节点会自动加入 {joining} 个探测任务，agent 最多只跑 {} 个",
                 Self::MAX_PROBES_PER_NODE
             );
         }
@@ -1735,7 +1945,12 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
         country: s("country"),
+        country_pin: s("country_pin"),
+        ipv4_pin: s("ipv4_pin"),
+        ipv6_pin: s("ipv6_pin"),
         last_seen: n("last_seen"),
+        notify: n("notify") != 0,
+        down_since: n("down_since"),
         token: s("token"),
     }
 }
@@ -1929,6 +2144,25 @@ mod tests {
         for column in ["node_id", "kind", "state", "since", "notified"] {
             assert!(columns.contains(column), "alert_state has no {column}: {columns:?}");
         }
+        // Shape as well as names, which is all `check_backup` and
+        // `an_upgraded_release_matches_a_fresh_database` compare: a `migrate_to_16`
+        // that lost the cascade or `WITHOUT ROWID` would satisfy both while
+        // leaving a removed node's rows behind for the next node to inherit its
+        // id, which is what the foreign key is there to prevent. Comments are
+        // dropped from the comparison, because `SCHEMA` documents each column
+        // where a migration restates the DDL alone.
+        let ddl = |c: &Connection| -> String {
+            let sql: String = c
+                .query_row("SELECT sql FROM sqlite_master WHERE name='alert_state'", [], |r| r.get(0))
+                .unwrap();
+            sql.lines()
+                .map(|l| l.split("--").next().unwrap_or("").trim())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let fresh = Db::open(":memory:").unwrap();
+        assert_eq!(ddl(&migrated), ddl(&fresh.conn()), "the migration must make the table `SCHEMA` makes");
         drop(migrated);
 
         db.restore_from(&bad).unwrap();
@@ -1959,7 +2193,7 @@ mod tests {
     fn the_backup_gate_asks_for_the_tables_every_version_has_carried() {
         assert_eq!(TABLES[..BACKUP_TABLES.len()], BACKUP_TABLES[..]);
         // Which is to say: `alert_state` is the only table a migration adds, and
-        // `migrate_to_4` is the only thing that can put it in an old file.
+        // `migrate_to_16` is the only thing that can put it in an old file.
         assert_eq!(TABLES.len(), BACKUP_TABLES.len() + 1);
         assert_eq!(TABLES[BACKUP_TABLES.len()], "alert_state");
     }
@@ -1988,6 +2222,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![id],
+                ..Default::default()
             })
             .unwrap();
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
@@ -2038,7 +2273,7 @@ mod tests {
         let db = db();
         let id = node(&db, 1);
         let facts = serde_json::json!({"hostname": "h"});
-        let save = |ip: &str| db.save_facts(id, &facts, ip).unwrap();
+        let save = |ip: &str| db.save_facts(id, &facts, ip, ip).unwrap();
         let stored = || db.node(id).unwrap().unwrap().country;
 
         assert!(save("198.51.100.4"), "a node with no country is owed a lookup");
@@ -2047,12 +2282,47 @@ mod tests {
         assert_eq!(stored(), "US");
         assert!(save("203.0.113.9"), "a new address is a new question");
         assert_eq!(stored(), "", "and the answer to the old one is gone");
+        assert!(db.country_owed(id, "203.0.113.9").unwrap(), "owed until an answer lands");
+        assert!(!db.country_owed(id, "198.51.100.4").unwrap(), "nothing is owed for an address left behind");
 
         // A lookup issued for the old address, arriving after the move.
         db.set_country(id, "US", "198.51.100.4").unwrap();
         assert_eq!(stored(), "", "an answer about an address the node has left is dropped");
         db.set_country(id, "JP", "203.0.113.9").unwrap();
         assert_eq!(stored(), "JP", "the answer about the address it is at now lands");
+        assert!(!db.country_owed(id, "203.0.113.9").unwrap());
+
+        // The source, not the connection address, is what the country belongs to:
+        // a proxy exit changing under a node with a public interface address
+        // leaves the badge alone.
+        assert!(!db.save_facts(id, &facts, "198.51.100.77", "203.0.113.9").unwrap());
+        assert_eq!(stored(), "JP");
+        // Nothing public to look up: no country, and none owed.
+        assert!(!db.save_facts(id, &facts, "192.168.1.2", "").unwrap());
+        assert_eq!(stored(), "");
+    }
+
+    /// A hub before schema 5 looked every country up from `ip`. After the
+    /// upgrade a node whose source is still `ip` keeps its badge, and one whose
+    /// public interface address now takes precedence is asked about again.
+    #[test]
+    fn countries_stored_before_the_source_column_belong_to_the_connection_address() {
+        let db = db();
+        let (kept, moved) = (node(&db, 1), node(&db, 1));
+        let facts = serde_json::json!({});
+        for id in [kept, moved] {
+            db.save_facts(id, &facts, "198.51.100.4", "198.51.100.4").unwrap();
+            db.set_country(id, "SG", "198.51.100.4").unwrap();
+        }
+        {
+            let conn = db.conn();
+            conn.execute_batch("ALTER TABLE node DROP COLUMN country_ip").unwrap();
+            migrate(&conn, 4).unwrap();
+        }
+        assert!(!db.save_facts(kept, &facts, "198.51.100.4", "198.51.100.4").unwrap());
+        assert_eq!(db.node(kept).unwrap().unwrap().country, "SG");
+        assert!(db.save_facts(moved, &facts, "198.51.100.4", "2001:db8::5").unwrap());
+        assert_eq!(db.node(moved).unwrap().unwrap().country, "");
     }
 
     #[test]
@@ -2183,6 +2453,13 @@ mod tests {
         assert_eq!((t.total_rx, t.total_tx), (8_000, 4_000), "the lifetime total never resets");
     }
 
+    /// Received 3, sent 5. "up" is the node's upload, which it sends.
+    #[test]
+    fn usage_is_counted_the_way_the_plan_meters_it() {
+        let t = Traffic { month_rx: 3, month_tx: 5, ..Default::default() };
+        assert_eq!(["sum", "up", "down", "max"].map(|mode| t.month_used(mode)), [8, 5, 3, 5]);
+    }
+
     #[test]
     fn period_start_handles_short_months_and_wraparound() {
         let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
@@ -2203,8 +2480,14 @@ mod tests {
     fn deleting_a_node_takes_its_data_with_it() {
         let db = db();
         let id = node(&db, 1);
-        let probe =
-            |nodes| PingTask { id: 0, name: "cm".into(), target: "1.1.1.1:443".into(), interval: 60, nodes };
+        let probe = |nodes| PingTask {
+            id: 0,
+            name: "cm".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes,
+            ..Default::default()
+        };
         let task = db.save_ping_task(&probe(vec![id])).unwrap();
         db.accumulate(id, "b", Some((10, 10))).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
@@ -2237,6 +2520,7 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 60,
             nodes: vec![id],
+            ..Default::default()
         };
         let old = db.save_ping_task(&probe("tokyo")).unwrap();
         db.insert_ping(id, old, 1, 999).unwrap();
@@ -2265,6 +2549,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![mine],
+                ..Default::default()
             })
             .unwrap();
 
@@ -2295,7 +2580,7 @@ mod tests {
     fn facts_from_an_unvouched_machine_cannot_choose_their_own_length() {
         let db = db();
         let id = node(&db, 1);
-        db.save_facts(id, &serde_json::json!({"os": "A".repeat(10_000), "hostname": "x\u{7}y"}), "ip")
+        db.save_facts(id, &serde_json::json!({"os": "A".repeat(10_000), "hostname": "x\u{7}y"}), "ip", "")
             .unwrap();
         let stored = db.node(id).unwrap().unwrap();
         assert_eq!(stored.os.chars().count(), 128);
@@ -2478,6 +2763,162 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// Every row of every table, comparable across two opens of one file.
+    ///
+    /// A table the file does not carry yet is skipped rather than fatal: a
+    /// migration that failed part-way leaves exactly that, and reading such a
+    /// file is what `a_failed_upgrade_leaves_the_file_as_it_was` does. `PRAGMA
+    /// table_info` on a table that is not there reports no columns, which is what
+    /// tells the two apart.
+    fn dump(conn: &Connection) -> Vec<String> {
+        let mut rows = Vec::new();
+        for table in TABLES {
+            if columns_of(conn, table).unwrap().is_empty() {
+                continue;
+            }
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let width = stmt.column_count();
+            let read =
+                |r: &rusqlite::Row| (0..width).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect();
+            let mut found: Vec<String> = stmt
+                .query_map([], |r| read(r))
+                .unwrap()
+                .map(|row: rusqlite::Result<Vec<_>>| format!("{table} {:?}", row.unwrap()))
+                .collect();
+            found.sort();
+            rows.extend(found);
+        }
+        rows
+    }
+
+    /// A file as the oldest release left it, one row in every table.
+    fn release_file(path: &str) {
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(include_str!("testdata/schema-v1.0.0.sql")).unwrap();
+        old.execute_batch(
+            "INSERT INTO setting VALUES ('site', 'https://hub.example.com');
+             INSERT INTO node (id, name, token, ip, country, created_at)
+               VALUES (1, 'n', 't', '198.51.100.4', 'US', 1);
+             INSERT INTO traffic (node_id, total_rx) VALUES (1, 5000);
+             INSERT INTO metric VALUES (1, 60, 12.5, 100, 0, 0, 0, 0, 0, 0, 0);
+             INSERT INTO ping_task (id, name, target) VALUES (1, 'cm', '1.1.1.1:443');
+             INSERT INTO ping_node VALUES (1, 1);
+             INSERT INTO ping_record VALUES (1, 1, 60, 42);
+             INSERT INTO session VALUES ('h', 9999999999);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+
+    /// v1.0.0's schema, opened by this build through the startup path. Fails on
+    /// a column `SCHEMA` gained without a migration or the reverse, on an index
+    /// in `SCHEMA` over a column only a migration adds, and on a migration that
+    /// changes the data when it runs a second time.
+    #[test]
+    fn an_upgraded_release_matches_a_fresh_database() {
+        let scratch = Scratch::new();
+        release_file(&scratch.0);
+        let db = Db::open(&scratch.0).unwrap();
+        let fresh = Db::open(":memory:").unwrap();
+        for table in TABLES {
+            assert_eq!(
+                columns_of(&db.conn(), table).unwrap(),
+                columns_of(&fresh.conn(), table).unwrap(),
+                "{table}"
+            );
+        }
+        let upgraded = dump(&db.conn());
+        // One row per table the release left behind, which is every one of
+        // `BACKUP_TABLES`. `alert_state` is this fork's own and has none: a
+        // migration adds the table rather than filling it, and
+        // `a_backup_taken_before_alert_state_existed_still_restores` is where that
+        // half is held.
+        assert_eq!(upgraded.len(), BACKUP_TABLES.len(), "every row survives: {upgraded:#?}");
+
+        // An earlier build opening the file stamps its own version, so the next
+        // upgrade runs every migration again.
+        db.conn().execute_batch("PRAGMA user_version = 3").unwrap();
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(dump(&db.conn()), upgraded, "a second run changes nothing");
+        let version: i64 = db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A file this fork stamped 4 carries `alert_state` and none of upstream's
+    /// columns: both sides claimed that number, and a hub of this fork is what
+    /// stamped it. `from < 5` runs upstream's 4 and 5 for it rather than taking
+    /// the stamp at its word, because the difference is not a missing table but a
+    /// missing column the notify code reads on every tick.
+    #[test]
+    fn a_file_this_fork_stamped_4_gains_what_upstreams_migrations_add() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = node(&db, 1);
+        db.save_facts(id, &serde_json::json!({"hostname": "vps-1"}), "198.51.100.4", "198.51.100.4").unwrap();
+        db.set_country(id, "US", "198.51.100.4").unwrap();
+        db.set_alert_state(id, "offline", "offline", 60, 0).unwrap();
+
+        // The fork's 4: this build's schema with everything upstream's 4, 5 and 6
+        // add taken back out, under the stamp that goes with it.
+        db.conn()
+            .execute_batch(
+                "ALTER TABLE node DROP COLUMN notify;
+                 ALTER TABLE node DROP COLUMN down_since;
+                 ALTER TABLE node DROP COLUMN country_ip;
+                 ALTER TABLE node DROP COLUMN country_pin;
+                 ALTER TABLE node DROP COLUMN ipv4_pin;
+                 ALTER TABLE node DROP COLUMN ipv6_pin;
+                 ALTER TABLE ping_task DROP COLUMN auto_join;
+                 PRAGMA user_version = 4",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&scratch.0).unwrap();
+        let columns = columns_of(&db.conn(), "node").unwrap();
+        for column in ["notify", "down_since", "country_ip", "country_pin", "ipv4_pin", "ipv6_pin"] {
+            assert!(columns.contains(column), "node has no {column} after the upgrade");
+        }
+        assert!(columns_of(&db.conn(), "ping_task").unwrap().contains("auto_join"));
+
+        // The backfill reads the row as it was: the country was looked up from
+        // `ip`, which is what the source now records, so the badge stands.
+        let source: String =
+            db.conn().query_row("SELECT country_ip FROM node WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(source, "198.51.100.4", "the source is the address the country came from");
+        assert_eq!(db.node(id).unwrap().unwrap().country, "US");
+
+        // The fork's own migration re-runs over the table it already made instead
+        // of creating a second one, and the row in it is left where it was.
+        let version: i64 = db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let states: i64 = db.conn().query_row("SELECT COUNT(*) FROM alert_state", [], |r| r.get(0)).unwrap();
+        assert_eq!(states, 1);
+    }
+
+    /// The trigger fails the UPDATE in `migrate_to_5` after `migrate_to_4` has
+    /// added its columns: a failure part-way through an upgrade.
+    #[test]
+    fn a_failed_upgrade_leaves_the_file_as_it_was() {
+        let scratch = Scratch::new();
+        release_file(&scratch.0);
+        let state = |c: &Connection| {
+            let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            (version, columns_of(c, "node").unwrap(), dump(c))
+        };
+        let before = {
+            let c = Connection::open(&scratch.0).unwrap();
+            c.execute_batch(
+                "CREATE TRIGGER fail BEFORE UPDATE ON node BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+            )
+            .unwrap();
+            state(&c)
+        };
+        assert!(Db::open(&scratch.0).is_err());
+        assert_eq!(state(&Connection::open(&scratch.0).unwrap()), before, "no step of the upgrade remains");
+    }
+
     /// Dropping `metric.load1` under a database in service. The column is
     /// `NOT NULL` with no default, so a migration that silently failed to run
     /// would not merely leave a stale column: it would prevent every history row
@@ -2536,6 +2977,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
+                ..Default::default()
             })
             .unwrap()
         };
@@ -2573,6 +3015,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes: vec![a, b],
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(db.ping_tasks_for(a).unwrap().len(), 1);
@@ -2584,10 +3027,90 @@ mod tests {
             target: "1.1.1.1:443".into(),
             interval: 30,
             nodes: vec![a],
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(db.ping_tasks_for(b).unwrap().len(), 0);
         assert_eq!(db.ping_tasks().unwrap()[0].interval, 30);
+    }
+
+    #[test]
+    fn an_auto_joining_probe_is_assigned_to_nodes_created_after_it() {
+        let db = db();
+        let existing = node(&db, 1);
+        let probe = |auto_join| PingTask {
+            id: 0,
+            name: "p".into(),
+            target: "1.1.1.1:443".into(),
+            interval: 60,
+            nodes: vec![],
+            auto_join,
+            ..Default::default()
+        };
+        let joining = db.save_ping_task(&probe(true)).unwrap();
+        db.save_ping_task(&probe(false)).unwrap();
+        assert!(db.ping_tasks_for(existing).unwrap().is_empty(), "existing nodes follow the list alone");
+
+        let added = node(&db, 1);
+        let assigned: Vec<i64> =
+            db.ping_tasks_for(added).unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+        assert_eq!(assigned, [joining]);
+        assert!(db.ping_tasks().unwrap()[0].auto_join);
+
+        // A new node takes every auto-joining probe at once, so their count is
+        // held to what one agent runs.
+        for _ in 1..Db::MAX_PROBES_PER_NODE {
+            db.save_ping_task(&probe(true)).unwrap();
+        }
+        assert!(db.save_ping_task(&probe(true)).is_err());
+        assert_eq!(db.ping_tasks().unwrap().len() as i64, Db::MAX_PROBES_PER_NODE + 1);
+    }
+
+    /// The editor's list is a snapshot, while `create_node` assigns auto-joining
+    /// probes whenever a node registers.
+    #[test]
+    fn an_edit_applies_only_the_assignments_it_changed() {
+        let db = db();
+        let (a, b) = (node(&db, 1), node(&db, 1));
+        let save = |id, nodes: Vec<i64>, base: Vec<i64>| {
+            db.save_ping_task(&PingTask {
+                id,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes,
+                auto_join: true,
+                base: Some(base),
+            })
+        };
+        let assigned = |id| {
+            let mut nodes = db.ping_tasks().unwrap().into_iter().find(|t| t.id == id).unwrap().nodes;
+            nodes.sort_unstable();
+            nodes
+        };
+        let id = save(0, vec![a], vec![]).unwrap();
+        let joined = node(&db, 1);
+
+        // Opened before `joined` existed, so it is in neither list and stays.
+        save(id, vec![a, b], vec![a]).unwrap();
+        assert_eq!(assigned(id), [a, b, joined]);
+        save(id, vec![b], vec![a, b]).unwrap();
+        assert_eq!(assigned(id), [b, joined]);
+
+        // Ticked after joining on its own: already assigned, not an error.
+        save(id, vec![b, joined], vec![b]).unwrap();
+        assert_eq!(assigned(id), [b, joined]);
+        // OR IGNORE leaves the foreign key in force.
+        assert!(save(id, vec![b, joined, 9999], vec![b, joined]).is_err(), "an id that is not a node");
+        assert_eq!(assigned(id), [b, joined]);
+
+        // A node deleted since the editor opened is in both lists and untouched.
+        db.delete_node(b).unwrap();
+        save(id, vec![b, joined], vec![b, joined]).unwrap();
+
+        db.delete_ping_task(id).unwrap();
+        assert!(save(id, vec![], vec![]).is_err(), "a deleted probe is not reported as saved");
+        assert!(db.ping_tasks().unwrap().is_empty());
     }
 
     /// The agent caps the probe list it will run and drops the remainder with
@@ -2605,6 +3128,7 @@ mod tests {
                 target: "1.1.1.1:443".into(),
                 interval: 60,
                 nodes,
+                ..Default::default()
             })
         };
         for _ in 0..Db::MAX_PROBES_PER_NODE {
@@ -2659,7 +3183,7 @@ mod tests {
             name: "x".into(),
             target: "1.1.1.1:443".into(),
             interval: 60,
-            nodes: vec![],
+            ..Default::default()
         };
         let err = db.save_ping_task(&orphan).unwrap_err().to_string();
         assert!(err.contains("不存在"), "{err}");
